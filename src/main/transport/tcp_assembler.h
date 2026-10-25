@@ -235,6 +235,7 @@ namespace aethon {
         // Longer than common backend keep-alive timeouts (nginx: 65 s), so idle keep-alive
         // connections are closed cleanly by the backend (FIN) before Aethon forgets them.
         static constexpr uint64_t AETHON_TCP_ESTAB_TIMEOUT_NS  = 120ULL * 1000000000ULL;
+        static constexpr uint64_t AETHON_TCP_TIMEWAIT_TIMEOUT_NS = 10ULL * 1000000000ULL;  // half-closed / FIN'd
         // Above this many sessions per worker, new SYNs are answered with SYN cookies
         // (no state until the client completes the handshake).
         static constexpr size_t AETHON_SYNCOOKIE_THRESHOLD = AETHON_MAX_ACTIVE_TCP_SESSION / 4;
@@ -742,9 +743,15 @@ namespace aethon {
                         TcpStreamSession *session = cell->val;
                         if (session) {
                             uint64_t age = now_ns - session->last_seen_ns;
-                            bool is_expired = (session->state == TcpState::SYN_SENT)
-                                                  ? (age > AETHON_TCP_SYN_TIMEOUT_NS)
-                                                  : (age > AETHON_TCP_ESTAB_TIMEOUT_NS);
+                            // SYN_SENT: 3 s. CLOSING / already-FIN'd (TIME_WAIT-like): 10 s, so
+                            // half-closed and abandoned connections are reclaimed quickly instead
+                            // of holding memory for the full established idle timeout. ESTABLISHED
+                            // keep-alive: 120 s (longer than typical backend keep-alive).
+                            uint64_t limit = (session->state == TcpState::SYN_SENT) ? AETHON_TCP_SYN_TIMEOUT_NS
+                                           : (session->state == TcpState::CLOSING || session->fin_sent)
+                                                 ? AETHON_TCP_TIMEWAIT_TIMEOUT_NS
+                                                 : AETHON_TCP_ESTAB_TIMEOUT_NS;
+                            bool is_expired = age > limit;
                             if (AETHON_UNLIKELY(is_expired)) {
                                 if (session->state != TcpState::SYN_SENT) {
                                     stats::count(stats::Event::SessionExpiredIdle);

@@ -308,6 +308,7 @@ namespace pipeline {
                 break;
             }
         }
+        
 
         if (packets_sent > 0) {
             session->last_tx_time_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

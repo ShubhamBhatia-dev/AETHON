@@ -151,22 +151,38 @@ fi
 # ------------------------------------------------------------------ 3. churn
 if want churn; then
   section "Connection churn (session table and memory must not leak)"
-  before=$(rss_mb)
   M=2000; [[ $QUICK -eq 1 ]] && M=500
+
+  # One churn cycle: short HTTP + HTTPS connections and a wrk connect/close storm.
+  churn_cycle() {
+    C python3 "$TOOL" many-short --count "$M" >/dev/null 2>&1
+    C python3 "$TOOL" many-short --tls --count $((M / 5)) >/dev/null 2>&1
+    if command -v wrk >/dev/null; then
+      C wrk -t2 -c200 -d10s -H "Connection: close" "http://$SERVER_IP/api/health" >/dev/null 2>&1
+      C wrk -t2 -c50 -d5s -H "Connection: close" "http://$SERVER_IP/" >/dev/null 2>&1
+    fi
+  }
+
+  # Functional churn check (connections all succeed) on the first cycle
   tool "$M sequential short HTTP connections"  many-short --count "$M"
   tool "$((M / 5)) sequential short HTTPS connections" many-short --tls --count $((M / 5))
   if command -v wrk >/dev/null; then
-    rps=$(C wrk -t2 -c200 -d10s -H "Connection: close" "http://$SERVER_IP/api/health" 2>&1 | awk '/Requests\/sec/ {print $2}')
     errs=$(C wrk -t2 -c50 -d5s -H "Connection: close" "http://$SERVER_IP/" 2>&1 | grep -c "Socket errors" || true)
-    info "wrk connect/close storm: ${rps:-?} req/s (new connection per request)"
     [[ "$errs" -eq 0 ]] && pass "no socket errors in a 5 s connect/close storm" || fail "socket errors during connect/close storm"
   fi
-  sleep 35   # let idle sessions expire (Aethon ESTABLISHED timeout = 30 s)
-  after=$(rss_mb)
-  info "RSS before churn ${before} MB, after churn + expiry ${after} MB"
-  awk -v b="$before" -v a="$after" 'BEGIN {exit !(a - b < 50)}' \
-    && pass "memory returned to normal after churn (growth < 50 MB)" \
-    || fail "memory grew by more than 50 MB after churn (possible session/buffer leak)"
+
+  # Leak test by plateau: measure after a full cycle has settled (half-closed sessions use a 10 s
+  # TIME_WAIT timeout and malloc_trim runs every 5 s), then run an identical cycle and settle again.
+  # A real per-session leak would add roughly as much the second time; reuse stays flat. This is
+  # robust to the allocator's high-water-mark, which an absolute-RSS check mistakes for a leak.
+  SETTLE=18
+  sleep "$SETTLE"; rss1=$(rss_mb)
+  churn_cycle
+  sleep "$SETTLE"; rss2=$(rss_mb)
+  info "RSS settled after cycle 1 = ${rss1} MB, after an identical cycle 2 = ${rss2} MB"
+  awk -v a="$rss1" -v b="$rss2" 'BEGIN {exit !(b - a < 40)}' \
+    && pass "no unbounded leak: a second churn cycle adds < 40 MB (memory is reused)" \
+    || fail "memory grew by >= 40 MB on the second cycle (possible per-session leak)"
   alive_check
 fi
 
