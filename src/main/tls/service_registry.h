@@ -74,6 +74,9 @@ inline SSL_CTX *create_ssl_context(const std::string &cert_path,
 
     SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION |
                                  SSL_OP_CIPHER_SERVER_PREFERENCE);
+    // Free OpenSSL's large read/write buffers (~16 KB each) between records, so an idle TLS
+    // connection holds a few KB instead of tens of KB.
+    SSL_CTX_set_mode(ctx, SSL_MODE_RELEASE_BUFFERS);
     if (SSL_CTX_use_certificate_file(ctx, cert_path.c_str(),
                                      SSL_FILETYPE_PEM) <= 0) {
       SSL_CTX_free(ctx);

@@ -57,7 +57,10 @@ namespace pipeline {
     // across all source IPs, which is acceptable for coarse flood control.
     class Ja3RateLimiter {
     public:
-        struct Config { uint32_t limit = 60; uint64_t window_ns = 10'000'000'000ULL; };
+        // Default limit is generous on purpose: one JA3 is shared by every client of a TLS
+        // library (all Chrome, all curl), so a low threshold throttles legitimate users. This
+        // only catches pathological floods; the dedicated unit test exercises the mechanism.
+        struct Config { uint32_t limit = 2000; uint64_t window_ns = 10'000'000'000ULL; };
 
         Ja3RateLimiter() : map_(4096) {}
         explicit Ja3RateLimiter(Config cfg) : cfg_(cfg), map_(4096) {}

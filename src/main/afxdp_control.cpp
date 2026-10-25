@@ -29,6 +29,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <immintrin.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 /*
   For IPv4 UDP
@@ -438,6 +441,12 @@ inline void stats_printer() {
         std::fflush(stdout);
         last_events = events;
       }
+#if defined(__GLIBC__)
+      // Return memory freed by closed sessions (reassembly rings, TLS buffers) to the OS.
+      // glibc keeps freed blocks in per-thread arenas, so after a burst of connections RSS
+      // stays high until a trim even though the memory is unused.
+      malloc_trim(0);
+#endif
     }
   }
 }

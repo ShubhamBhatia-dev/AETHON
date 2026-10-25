@@ -199,7 +199,7 @@ Being explicit about these is part of the project.
 - **No window scaling or SACK.** At most 64 KB in flight, so throughput over long, lossy paths is far below Linux.
 - **Uploads can stall under very heavy loss** (10% in both directions in the torture suite) until the backend times out; the cause is still being investigated.
 - **Idle sessions expire after 120 s** without a FIN or RST to the client; backends with shorter keep-alive timeouts (nginx: 65 s) close them cleanly first.
-- **No global memory budget.** Per-session buffers are capped, but a slow-read attack across many connections can still exhaust memory.
+- **No global memory budget.** Per-session buffers are capped and freed memory is returned to the OS periodically (malloc_trim) with OpenSSL buffers released between records, but there is still no hard cap, so a slow-read attack across many connections can exhaust memory.
 - **Flows must stay on one RX queue.** Sessions live in per-worker tables; real NICs guarantee this through RSS, while multi-queue veth setups need `net.core.txrehash=0` on the client.
 - **JA3 rate limiting is per worker**, not global: with N NIC queues one fingerprint can reach up to N x the limit across all source IPs before being throttled. All clients of one TLS library share a fingerprint, so set the limit well above normal demand.
 - **The XDP rate limiter and IP blocklist are implemented but disabled** in the BPF program.
