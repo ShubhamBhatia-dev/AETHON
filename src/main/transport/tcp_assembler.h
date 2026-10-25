@@ -743,14 +743,23 @@ namespace aethon {
                         TcpStreamSession *session = cell->val;
                         if (session) {
                             uint64_t age = now_ns - session->last_seen_ns;
-                            // SYN_SENT: 3 s. CLOSING / already-FIN'd (TIME_WAIT-like): 10 s, so
-                            // half-closed and abandoned connections are reclaimed quickly instead
-                            // of holding memory for the full established idle timeout. ESTABLISHED
-                            // keep-alive: 120 s (longer than typical backend keep-alive).
-                            uint64_t limit = (session->state == TcpState::SYN_SENT) ? AETHON_TCP_SYN_TIMEOUT_NS
-                                           : (session->state == TcpState::CLOSING || session->fin_sent)
-                                                 ? AETHON_TCP_TIMEWAIT_TIMEOUT_NS
-                                                 : AETHON_TCP_ESTAB_TIMEOUT_NS;
+                            // A session with unacknowledged or queued outbound data is still
+                            // actively delivering (e.g. the response + our FIN, retransmitting under
+                            // loss) and must NOT be reaped early, whatever its state.
+                            const bool has_outbound = (session->snd_una != session->send_nxt) ||
+                                                      !session->snd_buf.empty();
+                            // SYN_SENT: 3 s. Quiescent half-closed / FIN'd (TIME_WAIT-like): 10 s, so
+                            // abandoned connections are reclaimed quickly instead of holding memory
+                            // for the full established idle timeout. Everything else: 120 s (longer
+                            // than typical backend keep-alive).
+                            uint64_t limit;
+                            if (session->state == TcpState::SYN_SENT) {
+                                limit = AETHON_TCP_SYN_TIMEOUT_NS;
+                            } else if (!has_outbound && (session->state == TcpState::CLOSING || session->fin_sent)) {
+                                limit = AETHON_TCP_TIMEWAIT_TIMEOUT_NS;
+                            } else {
+                                limit = AETHON_TCP_ESTAB_TIMEOUT_NS;
+                            }
                             bool is_expired = age > limit;
                             if (AETHON_UNLIKELY(is_expired)) {
                                 if (session->state != TcpState::SYN_SENT) {
