@@ -50,8 +50,8 @@ template <typename Key, typename Value, Key EmptyKey = Key{},
           typename Hash = SingleThreadDefaultHash<Key>>
 class SingleThreadHashMap {
 public:
-  // Align Cell to avoid split cacheline accesses
-  struct alignas(implementation::hardware_destructive_interference_size) Cell {
+  // Cell packing for maximum L1/L2 cacheline density and minimal memory footprint
+  struct Cell {
     Key key{EmptyKey};
     Value val{};
 
@@ -76,7 +76,7 @@ public:
 
     capacity_ = capacity;
     mask_ = capacity_ - 1;
-    cells_ = implementation::smart_allocate<Cell, implementation::hardware_destructive_interference_size>(capacity_);
+    cells_ = implementation::smart_allocate<Cell, alignof(Cell)>(capacity_);
     for (size_t i = 0; i < capacity_; ++i) {
       new (&cells_[i]) Cell();
     }

@@ -68,6 +68,7 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #include "aethon/aethon.h"
 #include "tcp_congestion.h"
 #include "event_counters.h"
+#include "udp_assembler.h"
 #include <random>
 
 #ifndef AETHON_ALWAYS_INLINE
@@ -79,6 +80,7 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #endif
 
 #include "aethon/single_thread_hasmap.h"
+#include "allocator/slab_allocator.h"
 #include "tls_engine.h"
 #include <array>
 #include <cstddef>
@@ -275,8 +277,10 @@ namespace aethon {
             uint64_t last_seen_ns{0};
             TcpNegotiatedParams params{};
 
+            ReassemblyBufferPool *pool_{nullptr};
+            ReassemblyBuffer *reassembly_buf{nullptr};
             uint64_t *bitmap{nullptr};
-            uint8_t  *ring_buf{nullptr}; // 64 kb preallocated 
+            uint8_t  *ring_buf{nullptr};
 
             tls::TlsConnection tls_conn;
 
@@ -360,20 +364,12 @@ namespace aethon {
             TcpStreamSession() = default;
 
             ~TcpStreamSession() {
-
                 if(backend_fd >=0){
                     ::close(backend_fd);
                     backend_fd = -1;
                 }
 
-                if (ring_buf) {
-                    std::free(ring_buf);
-                    ring_buf = nullptr;
-                }
-                if (bitmap) {
-                    std::free(bitmap);
-                    bitmap = nullptr;
-                }
+                release_buffers();
 
                 if(hs_stream){
                     hs_close_stream(hs_stream, nullptr, nullptr, nullptr);
@@ -393,28 +389,31 @@ namespace aethon {
                 return backend_tx_buf.empty();
             }
 
-
-
-
-            AETHON_ALWAYS_INLINE bool init_bufferes() noexcept {
-                if(AETHON_LIKELY(ring_buf != nullptr)){
+            AETHON_ALWAYS_INLINE bool init_buffers(ReassemblyBufferPool &pool) noexcept {
+                if (AETHON_LIKELY(reassembly_buf != nullptr)) {
                     return true;
                 }
 
-                ring_buf = static_cast<uint8_t *>(implementation
-                ::smart_allocate<uint8_t,implementation::hardware_destructive_interference_size>(AETHON_TCP_WINDOW_SIZE));
-
-                if(AETHON_UNLIKELY(!ring_buf)) return false;
-
-                 bitmap = static_cast<uint64_t *>(
-                    implementation::smart_allocate<uint64_t, implementation::hardware_destructive_interference_size>(AETHON_TCP_BITMAP_WORDS * sizeof(uint64_t)));
-                if (AETHON_UNLIKELY(!bitmap)) {
-                    std::free(ring_buf);
-                    ring_buf = nullptr;
+                reassembly_buf = pool.acquire();
+                if (AETHON_UNLIKELY(!reassembly_buf)) {
                     return false;
                 }
-                std::memset(bitmap, 0, AETHON_TCP_BITMAP_WORDS * sizeof(uint64_t));
+                pool_ = &pool;
+                ring_buf = reassembly_buf->data;
+                bitmap = reassembly_buf->bitmap;
                 return true;
+            }
+
+            AETHON_ALWAYS_INLINE void release_buffers() noexcept {
+                if (reassembly_buf) {
+                    if (pool_) {
+                        pool_->release(reassembly_buf);
+                        pool_ = nullptr;
+                    }
+                    reassembly_buf = nullptr;
+                    ring_buf = nullptr;
+                    bitmap = nullptr;
+                }
             }
 
             AETHON_ALWAYS_INLINE bool forward_to_backend(const uint8_t *data, size_t len, uint16_t target_port) noexcept {
@@ -645,7 +644,7 @@ namespace aethon {
                  alignas(implementation::hardware_destructive_interference_size) std::array<uint8_t, AETHON_TCP_WINDOW_SIZE> drain_buf_{};
 
                  uint64_t last_cleanup_ns_{0};
-
+                 ReassemblyBufferPool reassembly_pool_;
                  // SYN cookie secret (per worker; a flow always returns to the same worker)
                  uint64_t cookie_k0_{0};
                  uint64_t cookie_k1_{0};
@@ -1021,7 +1020,7 @@ namespace aethon {
                         // our of order packets (gap/hole in the sequence)
                     }else if(TcpSeq::gt(cur_seq, session->rcv_nxt)){
 
-                        if(AETHON_LIKELY(session->init_bufferes())){
+                        if(AETHON_LIKELY(session->init_buffers(reassembly_pool_))){
                             if (session->conflicts_with_buffered(cur_seq, cur_payload, cur_len)) {
                                 result.is_closed = true;
                                 result.overlap_violation = true;
@@ -1034,12 +1033,14 @@ namespace aethon {
                             session->ooo_bytes += static_cast<uint32_t>(session->set_bitmap_range(cur_seq, cur_len));
                             // Duplicate ACK for rcv_nxt: lets the client fast-retransmit the missing segment
                             result.need_ack = true;
+                        } else {
+                            result.need_ack = true;
                         }
                     }
 
                     // gap - filler packet (fills the missing hole at rcv_nxt)
                     else{
-                        if(AETHON_LIKELY(session->init_bufferes())){
+                        if(AETHON_LIKELY(session->init_buffers(reassembly_pool_))){
                             if (session->conflicts_with_buffered(cur_seq, cur_payload, cur_len)) {
                                 result.is_closed = true;
                                 result.overlap_violation = true;
@@ -1064,6 +1065,10 @@ namespace aethon {
                                 result.payload = drain_buf_.data();
                                 result.payload_len = contiguous;
                                 result.is_ready = true;
+
+                                if (session->ooo_bytes == 0) {
+                                    session->release_buffers();
+                                }
                             }
                         }
                     }
