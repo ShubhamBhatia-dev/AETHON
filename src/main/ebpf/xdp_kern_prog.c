@@ -3,8 +3,10 @@
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/tcp.h>
+#include <linux/udp.h>
 #include <linux/ipv6.h>
 #include <linux/in.h>
+#include <linux/icmp.h>
 #include <bpf/bpf_endian.h>
 #include "common.h"
 
@@ -15,7 +17,60 @@
 #define AETHON_PER_CORE_REFILL_PER_SEC 50000ULL
 #define AETHON_MAX_XDP_RETURN_TYPE 5
 #define AETHON_MAX_RATE_LIMIT_PARAMETER 3
+#define AETHON_MAX_FIREWALL_RULES 64
 
+struct aethon_vlan_hdr {
+    __be16 h_vlan_TCI;
+    __be16 h_vlan_encapsulated_proto;
+};
+
+struct aethon_firewall_rule {
+    __u8  src_mac[6];
+    __u8  use_src_mac;
+    __u8  pad0;
+
+    __u8  dst_mac[6];
+    __u8  use_dst_mac;
+    __u8  pad1;
+
+    __u32 src_ip;
+    __u32 src_mask;
+    __u32 dst_ip;
+    __u32 dst_mask;
+
+    __u16 src_port;
+    __u16 dst_port;
+    __u16 vlan_id;
+    __u8  proto;
+    __u8  action; // 0 = DROP, 1 = ALLOW
+    __u8  active; // 1 = active rule
+    __u8  pad2[3];
+};
+
+static aethon_always_inline int mac_equal(const __u8 *a, const __u8 *b) {
+    #pragma unroll
+    for (int i = 0; i < 6; i++) {
+        if (a[i] != b[i]) return 0;
+    }
+    return 1;
+}
+
+
+
+/*
+
+ Bit:  15   14   13   12 11 10 9 8 7 6 5 4 3 2 1 0
+     ┌────┬────┬────┬───────────────────────────────┐
+     │ R  │ DF │ MF │       Fragment Offset         │
+     └────┴────┴────┴───────────────────────────────┘
+       ▲    ▲    ▲                  ▲
+       │    │    │                  └─ 13 bits: byte offset in original datagram
+       │    │    └─ Bit 13: "More Fragments" (MF) flag
+       │    └────── Bit 14: "Don't Fragment" (DF) flag
+       └─────────── Bit 15: Reserved (always 0)
+
+
+*/
 
 // getting the no of queeu map
 struct {
@@ -31,7 +86,7 @@ struct {
     __uint(max_entries, AETHON_MAX_IPS);
     __type(key, struct aethon_ip_address);
     __type(value, __u64);
-} aethon_ip_blockist SEC(".maps");
+} aethon_ip_blocklist SEC(".maps");
 
 struct{
     __uint(type,BPF_MAP_TYPE_HASH);
@@ -56,6 +111,25 @@ struct {
     __type(key, __u16);   // destination port in host byte order
     __type(value, __u8);  // 1 = active
 } aethon_services_map SEC(".maps");
+
+// Firewall ACL map (prioritized array of rules)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, AETHON_MAX_FIREWALL_RULES);
+    __type(key, __u32);
+    __type(value, struct aethon_firewall_rule);
+} aethon_firewall_map SEC(".maps");
+
+// Engine operation mode:
+// 0 = Bypass (pass all traffic directly to Linux OS network stack)
+// 1 = Match-Only (audit/monitor: rules and limits evaluate, but NEVER drop)
+// 2 = Full Protection (active inspection, drop enforcement; default)
+struct {
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, __u32);
+} match_only SEC(".maps");
 
 struct token_bucket_state{
     __u64 tokens;
@@ -151,7 +225,7 @@ static aethon_always_inline int token_bucket(struct aethon_ip_address* src_ip, s
 
             if (state->token_bucket.drop_count >= 8) {
                 __u64 flag = 1;
-                bpf_map_update_elem(&aethon_ip_blockist, src_ip, &flag, BPF_ANY);
+                bpf_map_update_elem(&aethon_ip_blocklist, src_ip, &flag, BPF_ANY);
                 bpf_printk("IP BLOCKLISTED DUE TO FLOOD\n");
             }
 
@@ -192,7 +266,7 @@ static aethon_always_inline int sliding_window_limiter(struct aethon_ip_address*
             bpf_printk("RATE LIMIT EXCEEDED - DROP\n");
             if (state->sliding_window_limiter.drop_count >= 8) {
                 __u64 flag = 1;
-                bpf_map_update_elem(&aethon_ip_blockist, src_ip, &flag, BPF_ANY);
+                bpf_map_update_elem(&aethon_ip_blocklist, src_ip, &flag, BPF_ANY);
                 bpf_printk("IP BLOCKLISTED DUE TO FLOOD\n");
             }
             return 0;
@@ -208,22 +282,51 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
     void *data = (void *)(long)ctx->data;
     int action = XDP_PASS;
 
+    // 0. Engine Mode Check:
+    //    0 = Bypass: pass all traffic directly to Linux OS network stack
+    //    1 = Match-only: audit/monitor mode (rules & rate limits evaluate, but NEVER drop)
+    //    2 = Full Protection: active drops & inspection (DEFAULT = 2)
+    __u32 mode_key = 0;
+    __u32 *mode_ptr = bpf_map_lookup_elem(&match_only, &mode_key);
+    __u32 mode = mode_ptr ? *mode_ptr : 2;
+
+    if (mode == 0) {
+        action = XDP_PASS;
+        goto out;
+    }
+
     // 1. Parse Ethernet Header
     struct ethhdr *eth = (struct ethhdr *)data;
     if ((void *)(eth + 1) > data_end) 
         return XDP_DROP;
 
-    // 2. Parse IP Header & Extract src_ip FIRST
-    
+    // 2. Parse VLAN Tagging (802.1Q and 802.1ad QinQ)
+    void *nh = (void *)(eth + 1);
+    __be16 h_proto = eth->h_proto;
+    __u16 vlan_id = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        if (h_proto == bpf_htons(ETH_P_8021Q) || h_proto == bpf_htons(ETH_P_8021AD)) {
+            struct aethon_vlan_hdr *vlh = (struct aethon_vlan_hdr *)nh;
+            if ((void *)(vlh + 1) > data_end)
+                return XDP_DROP;
+            h_proto = vlh->h_vlan_encapsulated_proto;
+            vlan_id = bpf_ntohs(vlh->h_vlan_TCI) & 0x0FFF;
+            nh = (void *)(vlh + 1);
+        }
+    }
+
     struct aethon_ip_address src_ip = {};
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-        struct iphdr *iph = (struct iphdr *)(eth + 1);
+    struct iphdr *iph = NULL;
+    if (h_proto == bpf_htons(ETH_P_IP)) {
+        iph = (struct iphdr *)nh;
         if ((void *)(iph + 1) > data_end) 
             return XDP_DROP;
         src_ip.addr.v4 = iph->saddr;
         src_ip.is_ipv6 = 0;
-    } else if (eth->h_proto == bpf_htons(ETH_P_IPV6)) {
-        // IPv6 is not proxied in user space; pass directly to Linux kernel network stack
+    } else if (h_proto == bpf_htons(ETH_P_IPV6)) {
+        // IPv6 is passed to Linux network stack
         action = XDP_PASS;
         goto out;
     } else {
@@ -231,21 +334,81 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         action = XDP_PASS;
         goto out;
     }
+
+    // Extract L4 ports for firewall filtering
+    __u16 sport = 0, dport = 0;
+    if (iph->protocol == IPPROTO_TCP) {
+        if (iph->ihl >= 5) {
+            struct tcphdr *tcph = (struct tcphdr *)((void *)iph + (iph->ihl * 4));
+            if ((void *)(tcph + 1) <= data_end) {
+                sport = bpf_ntohs(tcph->source);
+                dport = bpf_ntohs(tcph->dest);
+            }
+        }
+    } else if (iph->protocol == IPPROTO_UDP) {
+        struct udphdr *udph = (struct udphdr *)((void *)iph + (iph->ihl * 4));
+        if ((void *)(udph + 1) <= data_end) {
+            sport = bpf_ntohs(udph->source);
+            dport = bpf_ntohs(udph->dest);
+        }
+    }
+
+    // 3. Firewall ACL evaluation (Priority order 0..31)
+    #pragma unroll
+    for (__u32 i = 0; i < 32; i++) {
+        __u32 r_idx = i;
+        struct aethon_firewall_rule *r = bpf_map_lookup_elem(&aethon_firewall_map, &r_idx);
+        if (!r || !r->active)
+            continue;
+
+        if (r->use_src_mac && !mac_equal(eth->h_source, r->src_mac))
+            continue;
+        if (r->use_dst_mac && !mac_equal(eth->h_dest, r->dst_mac))
+            continue;
+        if (r->vlan_id != 0 && r->vlan_id != vlan_id)
+            continue;
+        if (r->proto != 0 && r->proto != iph->protocol)
+            continue;
+        if (r->src_mask != 0 && (iph->saddr & r->src_mask) != (r->src_ip & r->src_mask))
+            continue;
+        if (r->dst_mask != 0 && (iph->daddr & r->dst_mask) != (r->dst_ip & r->dst_mask))
+            continue;
+        if (r->src_port != 0 && r->src_port != sport)
+            continue;
+        if (r->dst_port != 0 && r->dst_port != dport)
+            continue;
+
+        // Matched!
+        if (r->action == 0) { // DISALLOW / DROP
+            if (mode == 1) {
+                // Mode 1: Match-only, skip drop and continue
+                goto allow_firewall;
+            }
+            action = XDP_DROP;
+            goto out;
+        } else { // ALLOW (skip blocklists and rate-limiter)
+            goto allow_firewall;
+        }
+    }
+
+    // 4. IP Blocklist & Rate Limiter
     __u8 is_test_subnet = (src_ip.is_ipv6 == 0 && (bpf_ntohl(src_ip.addr.v4) & 0xFFFFFF00) == 0xC0A83200);
 
-    /*
     if (!is_test_subnet) {
-        if (bpf_map_lookup_elem(&aethon_ip_blockist, &src_ip)) {
+        if (bpf_map_lookup_elem(&aethon_ip_blocklist, &src_ip)) {
+            if (mode == 1) {
+                goto allow_firewall;
+            }
             action = XDP_DROP;
             goto out;
         }
 
-    __u16 key_token = 1;
-    __u16 key_window = 2;
-    __u16 key_limit = 3;
-    __u64* tokens_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_token);
-    __u64* limit_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_limit);
-    __u64* window_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_window);
+        __u16 key_token = 1;
+        __u16 key_window = 2;
+        __u16 key_limit = 3;
+        __u64* tokens_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_token);
+        __u64* limit_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_limit);
+        __u64* window_ptr = bpf_map_lookup_elem(&rate_limiter_params, &key_window);
 
         __u64 tokens_val = tokens_ptr ? *tokens_ptr : 100000ULL;
         __u64 limit_val = limit_ptr ? *limit_ptr : 50000ULL;
@@ -274,30 +437,28 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
         }
 
         if (!resp) {
+            if (mode == 1) {
+                goto allow_firewall;
+            }
             action = XDP_DROP;
             goto out;
         }
     }
-    */
 
-    
+allow_firewall:
+    // 5. Attack Checks (fragment check)
+    if (iph != NULL) {
+        __u16 frag_off_check = bpf_ntohs(iph->frag_off);
+        __u8 is_fragment_check = (frag_off_check & 0x3FFF) != 0 || (frag_off_check & 0x2000) != 0;
 
-    // 5. Attack Checks (only runs if rate limiter passed)
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-        struct iphdr *iph_check = (struct iphdr *)(eth + 1);
-        if ((void *)(iph_check + 1) <= data_end) {
-            __u16 frag_off_check = bpf_ntohs(iph_check->frag_off);
-            __u8 is_fragment_check = (frag_off_check & 0x3FFF) != 0 || (frag_off_check & 0x2000) != 0;
-
-            if (is_fragment_check && iph_check->protocol == IPPROTO_TCP) {
-                bpf_printk("TCP FRAGMENT ATTACK BLOCKED\n");
+        if (is_fragment_check && iph->protocol == IPPROTO_TCP) {
+            if (mode != 1) {
                 action = XDP_DROP;
                 goto out;
             }
         }
     }
 
-    
     // Dynamic queue routing
     __u32 key = 0;
     __u32 *num_queues_ptr  = (__u32 * )bpf_map_lookup_elem(&queue_config_map, &key);
@@ -306,10 +467,7 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
     // Spread incoming hardware queues evenly across active worker queues
     __u32 target_queue = ctx->rx_queue_index % dynamic_num_queues;
 
-    if (eth->h_proto == bpf_htons(ETH_P_IP)) {
-        struct iphdr *iph = (struct iphdr *)(eth + 1);
-        if ((void *)(iph + 1) > data_end) return XDP_DROP;
-
+    if (iph != NULL) {
         if (iph->protocol == IPPROTO_TCP) {
             if (iph->ihl < 5) return XDP_DROP;
             void *tcp_start = (void *)iph + (iph->ihl * 4);
@@ -322,8 +480,23 @@ int aethon_xdp_prog_main(struct xdp_md * ctx) {
                 action = XDP_PASS;
                 goto out;
             }
+        } else if (iph->protocol == IPPROTO_UDP) {
+            void *udp_start = (void *)iph + (iph->ihl * 4);
+            struct udphdr *udph = (struct udphdr *)udp_start;
+            if ((void *)(udph + 1) > data_end) return XDP_DROP;
+            // Redirect UDP traffic to AF_XDP for user-space reassembly and full Hyperscan IDS inspection!
         } else if (iph->protocol == IPPROTO_ICMP) {
-            // Keep for fast user-space ICMP echo reply
+            void *icmp_start = (void *)iph + (iph->ihl * 4);
+            struct icmphdr *icmph = (struct icmphdr *)icmp_start;
+            if ((void *)(icmph + 1) > data_end) return XDP_DROP;
+            // Only redirect ICMP Echo requests (type 8, code 0) to AF_XDP for fast replies.
+            // Non-echo ICMP (Type 3 Code 4 PMTU, Time Exceeded, etc.) are passed to kernel!
+            if (icmph->type == 8 && icmph->code == 0) {
+                // Keep for fast user-space ICMP echo reply
+            } else {
+                action = XDP_PASS;
+                goto out;
+            }
         } else {
             action = XDP_PASS;
             goto out;

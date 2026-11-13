@@ -32,6 +32,7 @@
 #include <unistd.h>
 #include <xdp/libxdp.h>
 #include <xdp/xsk.h>
+#include "config/constants.h"
 
 namespace aethon {
 namespace xdp {
@@ -44,15 +45,15 @@ namespace xdp {
  * fallback ring capacity, and batch processing budget via template parameters.
  */
 template <
-    size_t NumFrames = 4096,
-    size_t FrameSize = 2048,
-    size_t RxRingSize = 2048,
-    size_t TxRingSize = 2048,
-    size_t FillRingSize = 2048,
-    size_t CompRingSize = 2048,
-    size_t MaxQueues = 64,
-    size_t FallbackCapacity = 4096,
-    size_t BatchSize = 64
+    size_t NumFrames = config::net::DEFAULT_NUM_FRAMES,
+    size_t FrameSize = config::net::DEFAULT_FRAME_SIZE,
+    size_t RxRingSize = config::net::DEFAULT_RING_SIZE,
+    size_t TxRingSize = config::net::DEFAULT_RING_SIZE,
+    size_t FillRingSize = config::net::DEFAULT_RING_SIZE,
+    size_t CompRingSize = config::net::DEFAULT_RING_SIZE,
+    size_t MaxQueues = config::net::DEFAULT_MAX_QUEUES,
+    size_t FallbackCapacity = config::net::DEFAULT_FALLBACK_CAPACITY,
+    size_t BatchSize = config::net::DEFAULT_BATCH_SIZE
 >
 struct XdpConfig {
   static_assert((NumFrames & (NumFrames - 1)) == 0, "NumFrames must be power of 2");
@@ -129,7 +130,7 @@ struct alignas(implementation::hardware_destructive_interference_size)
 
 // Each queue slot occupies its own dedicated 64-byte cache line
 struct alignas(
-    implementation::hardware_constructive_interference_size) QueueSlot {
+    implementation::hardware_destructive_interference_size) QueueSlot {
   aethon_xsk_socket_info *socket_info{nullptr};
 };
 // Query available NIC queues using ethtool ioctl
@@ -269,8 +270,8 @@ public:
                 << open_err << '\n';
       return false;
   }
-  bool reused_blockist = false;
-  if (!load_xdp_map(bpf_obj_, "aethon_ip_blockist", "/sys/fs/bpf/aethon/aethon_ip_blockist", reused_blockist))
+  bool reused_blocklist = false;
+  if (!load_xdp_map(bpf_obj_, "aethon_ip_blocklist", "/sys/fs/bpf/aethon/aethon_ip_blocklist", reused_blocklist))
     return false;
 
   bool reused_rate_limiter = false;
@@ -279,6 +280,18 @@ public:
 
   bool reused_params = false;
   if (!load_xdp_map(bpf_obj_, "rate_limiter_params", "/sys/fs/bpf/aethon/rate_limiter_params", reused_params))
+    return false;
+
+  bool reused_firewall = false;
+  if (!load_xdp_map(bpf_obj_, "aethon_firewall_map", "/sys/fs/bpf/aethon/aethon_firewall_map", reused_firewall))
+    return false;
+
+  bool reused_services = false;
+  if (!load_xdp_map(bpf_obj_, "aethon_services_map", "/sys/fs/bpf/aethon/aethon_services_map", reused_services))
+    return false;
+
+  bool reused_mode = false;
+  if (!load_xdp_map(bpf_obj_, "match_only", "/sys/fs/bpf/aethon/match_only", reused_mode))
     return false;
 
   if (bpf_object__load(bpf_obj_) != 0) {

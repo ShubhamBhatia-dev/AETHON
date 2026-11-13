@@ -11,17 +11,35 @@ ROOT="$(cd "$DIR/../.." && pwd)"
 RUN_DIR="${RUN_DIR:-/tmp/aethon_web_app_test}"
 NODE_PORT=3000
 NGINX_PORT=8080
+NGINX_SSL_PORT=8443
 
 info() { echo -e "\033[94m[web_app_test]\033[0m $*"; }
 die()  { echo -e "\033[91m[web_app_test] $*\033[0m" >&2; exit 1; }
+
+if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" && "$SUDO_USER" != "root" ]]; then
+  # Re-run under invoking user so node/nvm and user PATH work seamlessly
+  exec sudo -u "$SUDO_USER" PATH="$PATH" "$0" "$@"
+fi
 
 [[ $EUID -eq 0 ]] && die "Run as your normal user, not root (node via nvm is usually not on root's PATH)."
 command -v node  >/dev/null || die "node not found (install Node.js >= 18)"
 command -v nginx >/dev/null || die "nginx not found: sudo apt install -y nginx"
 command -v curl  >/dev/null || die "curl not found"
 
-# Refuse to start if something else already owns the ports
-for port in $NODE_PORT $NGINX_PORT; do
+# Clean up any lingering test python backends that might conflict on port 8080
+pkill -f multi_backend_server.py 2>/dev/null || true
+pkill -f flask_backend.py 2>/dev/null || true
+
+# If old nginx/node instances are still active, stop them first
+if ss -ltn "sport = :$NGINX_PORT" 2>/dev/null | grep -q LISTEN || \
+   ss -ltn "sport = :$NGINX_SSL_PORT" 2>/dev/null | grep -q LISTEN || \
+   ss -ltn "sport = :$NODE_PORT" 2>/dev/null | grep -q LISTEN; then
+  "$DIR/stop.sh" >/dev/null 2>&1 || true
+  sleep 0.5
+fi
+
+# Refuse to start if something else still owns the ports
+for port in $NODE_PORT $NGINX_PORT $NGINX_SSL_PORT; do
   if ss -ltn "sport = :$port" | grep -q LISTEN; then
     die "port $port is already in use (run ./stop.sh, or stop the other service)"
   fi
@@ -42,6 +60,11 @@ sudo ip netns exec client_ns ethtool -K veth1 gro off gso off tso off tx off >/d
 # so a flow always stays on one queue; disable re-hashing in the client to behave the same.
 info "disabling TX re-hashing in client_ns (keeps each flow on one queue, like NIC RSS)"
 sudo ip netns exec client_ns sysctl -qw net.core.txrehash=0 || true
+sudo ip netns exec client_ns sysctl -qw net.ipv4.tcp_tw_reuse=1 || true
+sudo ip netns exec client_ns sysctl -qw net.ipv4.tcp_fin_timeout=2 || true
+sudo ip netns exec client_ns sysctl -qw net.ipv4.ip_local_port_range="1024 65535" || true
+sudo ip netns exec client_ns sysctl -qw net.ipv4.tcp_max_syn_backlog=65536 || true
+sudo ip netns exec client_ns sysctl -qw net.core.somaxconn=65536 || true
 
 # 2. Runtime directories and large test files with known checksums
 mkdir -p "$RUN_DIR"/{logs,files,tmp}
@@ -55,7 +78,7 @@ done
 (cd "$RUN_DIR/files" && sha256sum ./*.bin > SHA256SUMS)
 
 # 3. nginx config
-sed -e "s|__RUN_DIR__|$RUN_DIR|g" -e "s|__PUBLIC_DIR__|$DIR/public|g" \
+sed -e "s|__RUN_DIR__|$RUN_DIR|g" -e "s|__PUBLIC_DIR__|$DIR/public|g" -e "s|__ROOT__|$ROOT|g" \
   "$DIR/nginx/nginx.conf.template" > "$RUN_DIR/nginx.conf"
 
 # 4. Node backend

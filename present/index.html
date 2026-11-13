@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aethon — Project Presentation · Group 7</title>
+<style>
+  :root{
+    --bg:#eef1f5; --page:#ffffff; --ink:#15223b; --body:#36415a; --muted:#6b7689;
+    --line:#dfe4ec; --line2:#eaeef4; --navy:#1b3a6b; --accent:#1f6feb; --teal:#0e7c86;
+    --ok:#1f8a4c; --warn:#b4690e; --bad:#c0392b;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+    --sans:"Segoe UI",system-ui,-apple-system,Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--body);font-family:var(--sans);line-height:1.5}
+  .deck{height:100%;overflow-y:auto;scroll-snap-type:y mandatory;scroll-behavior:smooth}
+  section.slide{min-height:100vh;scroll-snap-align:start;display:flex;justify-content:center;align-items:stretch;
+    padding:clamp(16px,3vw,40px) clamp(16px,4vw,56px) 64px}
+  .sheet{width:min(1180px,100%);background:var(--page);border:1px solid var(--line);border-radius:10px;
+    box-shadow:0 1px 2px rgba(20,34,59,.05),0 12px 32px rgba(20,34,59,.06);
+    padding:clamp(22px,3.2vw,44px);display:flex;flex-direction:column;gap:14px;align-self:center}
+  .head{display:flex;justify-content:space-between;align-items:baseline;border-bottom:2px solid var(--navy);padding-bottom:10px;gap:16px;flex-wrap:wrap}
+  .secno{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--navy);font-weight:700}
+  .brandmini{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  h1{font-size:clamp(30px,4.6vw,54px);line-height:1.08;margin:0;color:var(--ink);font-weight:800;letter-spacing:-.015em}
+  h2{font-size:clamp(20px,2.7vw,30px);line-height:1.15;margin:0;color:var(--ink);font-weight:750;letter-spacing:-.01em}
+  h3{margin:0 0 8px;font-size:14px;color:var(--navy);font-weight:700;font-family:var(--mono);letter-spacing:.02em;text-transform:uppercase}
+  p{margin:.35em 0}
+  .lead{font-size:clamp(14.5px,1.5vw,17px);color:var(--body);max-width:78ch}
+  .small{font-size:13px}
+  .muted{color:var(--muted)}
+  .grid{display:grid;gap:14px}
+  @media(min-width:780px){.g2{grid-template-columns:1fr 1fr}.g3{grid-template-columns:repeat(3,1fr)}}
+  @media(min-width:1040px){.g4{grid-template-columns:repeat(4,1fr)}.g2-3{grid-template-columns:1.05fr .95fr}}
+  .card{background:#fbfcfe;border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .card.alt{background:#f6f9fd;border-color:#dbe6f5}
+  ul{margin:4px 0;padding-left:18px}
+  li{margin:5px 0;font-size:13.5px;color:#30405d}
+  li b{color:var(--ink)}
+  .kv{display:flex;flex-wrap:wrap;gap:10px 26px;margin-top:4px}
+  .kv div{font-size:13.5px}
+  .kv .k{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+  .pill{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--navy);background:#eef3fb;border:1px solid #d6e2f4;border-radius:999px;padding:3px 10px;margin:4px 6px 0 0}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)} .teal{color:var(--teal)}
+  code,.mono{font-family:var(--mono)}
+  .stat{display:flex;flex-wrap:wrap;gap:12px;margin-top:4px}
+  .stat .box{background:#fbfcfe;border:1px solid var(--line);border-radius:10px;padding:10px 16px;min-width:140px}
+  .stat .num{font-family:var(--mono);font-size:clamp(19px,2.2vw,24px);font-weight:700;color:var(--navy)}
+  .stat .lbl{font-size:12px;color:var(--muted)}
+  /* title group banner */
+  .groupbar{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap;
+    background:var(--navy);color:#fff;border-radius:8px;padding:10px 16px;margin-bottom:4px}
+  .groupbar .g{font-family:var(--mono);font-weight:700;letter-spacing:.06em;font-size:15px}
+  .groupbar .inst{font-size:13px;opacity:.9}
+  /* architecture */
+  .arch{display:flex;flex-direction:column;align-items:center;gap:0;margin:2px 0}
+  .node{width:min(820px,100%);background:#fbfcfe;border:1px solid var(--line);border-radius:9px;padding:10px 16px}
+  .node .t{font-family:var(--mono);font-size:13px;color:var(--navy);font-weight:700}
+  .node .d{font-size:13px;color:#30405d;margin-top:2px}
+  .node.k{background:#f3f9f4;border-color:#cfe6d4}
+  .node.u{background:#f2f6fd;border-color:#d4e2f6}
+  .node.x{background:#f6f3fb;border-color:#e0d6f1}
+  .arrow{color:var(--muted);font-family:var(--mono);font-size:12px;padding:5px 0}
+  footer.bar{position:fixed;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:space-between;
+    padding:7px 16px;background:rgba(255,255,255,.9);backdrop-filter:blur(6px);border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:12px;color:var(--muted);z-index:10}
+  .dots{display:flex;gap:7px}
+  .dots button{width:9px;height:9px;border-radius:50%;border:1px solid #c3cdda;background:#fff;cursor:pointer;padding:0}
+  .dots button[aria-current="true"]{background:var(--navy);border-color:var(--navy)}
+  a{color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="deck" id="deck">
+
+  <!-- 1 — TITLE -->
+  <section class="slide" id="s1">
+    <div class="sheet">
+      <div class="groupbar">
+        <span class="g">GROUP No. 7</span>
+        <span class="inst">Indian Institute of Technology, Mandi · Course Project</span>
+      </div>
+      <div class="head">
+        <span class="secno">Project Presentation</span>
+        <span class="brandmini">eBPF/XDP · AF_XDP · Modern C++20</span>
+      </div>
+      <h1>Aethon</h1>
+      <p class="lead" style="font-size:clamp(16px,1.9vw,20px);color:var(--ink)">
+        An inline Intrusion-Prevention System and TLS-terminating reverse proxy built on Linux
+        <b>eBPF/XDP</b> and <b>AF_XDP kernel bypass</b>, with its own <b>userspace TCP stack</b>.</p>
+      <p class="lead">
+        Aethon runs in front of the web services on a single host. The XDP program steers traffic for the
+        protected ports into userspace through AF_XDP sockets, while all other traffic — SSH, DNS, UDP, IPv6 —
+        is passed straight to the kernel. In userspace, Aethon terminates TCP and TLS itself, inspects the
+        decrypted payload with the Hyperscan regex engine, enforces domain (SNI) and JA3 fingerprint policy,
+        and forwards clean traffic to the backend over loopback.</p>
+      <div class="card alt">
+        <h3>Problem statement</h3>
+        <p class="small" style="margin:0">
+          Inspecting web traffic on one host conventionally requires three or four separate systems — the kernel
+          TCP stack, an IDS such as Suricata (copying every packet to userspace via NFQUEUE), a TLS terminator,
+          and a web-application firewall. This is costly in copies, context switches and memory. Aethon unifies
+          them into a <b>single process on the packet path</b> that drops hostile traffic early, inside the NIC
+          driver, before the kernel allocates any state for it.</p>
+      </div>
+      <div class="kv">
+        <div><div class="k">Domain</div>High-performance networking &amp; security</div>
+        <div><div class="k">Language</div>C++20, plus eBPF C</div>
+        <div><div class="k">Core tech</div>AF_XDP, eBPF/XDP, OpenSSL, Hyperscan, io_uring</div>
+        <div><div class="k">Status</div>Working prototype, tested end-to-end</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2 — ARCHITECTURE -->
+  <section class="slide" id="s2">
+    <div class="sheet">
+      <div class="head"><span class="secno">02 — System Architecture</span><span class="brandmini">Dual-plane design</span></div>
+      <h2>A kernel data plane and a userspace analytics/control plane</h2>
+      <p class="lead">Responsibilities are split between a <b>data plane</b> that runs inside the NIC driver (eBPF/XDP)
+        and a <b>userspace engine</b> connected by zero-copy shared-memory rings (AF_XDP). The data plane makes
+        instant, cheap decisions; the userspace plane does the stateful, expensive work.</p>
+      <div class="arch">
+        <div class="node"><div class="t">Client / Internet  →  NIC driver (eth0 / veth0)</div></div>
+        <div class="arrow">│  every packet</div>
+        <div class="node x"><div class="t">XDP / eBPF data plane</div>
+          <div class="d">Protected TCP ports → redirect to AF_XDP · TCP fragments → <b>XDP_DROP</b> · SSH / DNS / UDP / IPv6 → <b>XDP_PASS</b> to the kernel</div></div>
+        <div class="arrow">│  AF_XDP RX ring — zero-copy into UMEM (no syscall, no sk_buff per packet)</div>
+        <div class="node u"><div class="t">Userspace engine — one worker thread pinned per NIC queue</div>
+          <div class="d">TCP state machine &amp; reassembly  →  TLS termination (OpenSSL)  →  Hyperscan DPI  →  epoll proxy to backend on 127.0.0.1</div>
+          <div class="d muted">Each worker owns a private session table; a connection always returns to the same queue via the NIC's RSS hashing, so there are <b>no locks on the hot path</b>.</div></div>
+        <div class="arrow">│  clean flow → backend &nbsp;&nbsp;|&nbsp;&nbsp; rule match / policy violation → RST to client</div>
+        <div class="node k"><div class="t">Backend service (nginx / application)  ·  responses returned to the client via the AF_XDP TX ring</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 3 — IMPLEMENTED -->
+  <section class="slide" id="s3">
+    <div class="sheet">
+      <div class="head"><span class="secno">03 — Work Completed</span><span class="brandmini">What is implemented</span></div>
+      <h2>A functional inline security data path, built from first principles</h2>
+      <div class="grid g4">
+        <div class="card"><h3>Data plane · eBPF/XDP</h3><ul>
+          <li>Port-based steering of protected services into AF_XDP sockets</li>
+          <li>TCP-fragment dropping (a classic IDS-evasion vector)</li>
+          <li>Multi-queue scaling: one AF_XDP socket and one core-pinned worker per NIC queue</li>
+          <li>Zero-copy bind attempted, automatic copy-mode fallback</li></ul></div>
+        <div class="card"><h3>Userspace TCP stack</h3><ul>
+          <li>Three-way handshake with a SipHash-randomised ISN (RFC 6528)</li>
+          <li><b>SYN cookies</b> under table pressure (stateless flood defence)</li>
+          <li>Out-of-order reassembly with <b>overlap-evasion detection</b></li>
+          <li>Bidirectional flow control with real window advertisement</li>
+          <li>RFC 6298 retransmission timer, Reno congestion control, fast retransmit, go-back-N</li>
+          <li>Graceful and half close, FIN retransmission, TCP checksum verification</li></ul></div>
+        <div class="card"><h3>TLS termination</h3><ul>
+          <li>Full termination via OpenSSL memory BIOs</li>
+          <li>Reassembly of a ClientHello split across segments (large modern browser hellos)</li>
+          <li>SNI domain blocklist, including sub-domains</li>
+          <li><b>JA3 fingerprinting</b> with a per-worker rate limiter</li></ul></div>
+        <div class="card"><h3>Deep packet inspection</h3><ul>
+          <li>Hyperscan in <b>streaming mode</b> — detects patterns split across packets and TLS records</li>
+          <li>Loads thousands of Snort/Suricata rules with a block / alert policy model</li>
+          <li>Direction, unsupported-condition and weak-pattern filtering to avoid false positives</li>
+          <li>Compiled rule database cached to disk: ≈45 s compile → ≈20 ms reload</li></ul></div>
+      </div>
+      <p class="small muted">All of the above is implemented and exercised by the test suite described in Section 04.</p>
+    </div>
+  </section>
+
+  <!-- 4 — DEPTH + TESTING -->
+  <section class="slide" id="s4">
+    <div class="sheet">
+      <div class="head"><span class="secno">04 — Engineering Depth &amp; Validation</span><span class="brandmini">Hard problems &amp; testing</span></div>
+      <h2>Non-trivial problems solved, and proven by tests</h2>
+      <div class="grid g2-3">
+        <div class="card"><h3>Representative hard problems</h3><ul>
+          <li><b>TCP overlap-evasion detection</b> (Ptacek &amp; Newsham, 1998): a retransmission that is re-cut at
+              different boundaries must not be mistaken for an attack. Aethon compares only the bytes already
+              buffered (via a bitmap), not the whole range — removing a false-positive that reset legitimate uploads.</li>
+          <li><b>Two-way flow control &amp; backpressure</b>: the advertised receive window reflects real buffer space,
+              and pressure is propagated both to the client and from the backend, preventing unbounded memory growth.</li>
+          <li><b>Correct concurrency</b>: a JA3 rate limiter that was shared across worker threads was a genuine
+              data race (the map's internals are not atomic even when the stored values are). It was redesigned as a
+              per-worker limiter — no shared state, no locks — demonstrated with a reproduction of lost updates.</li>
+          <li><b>Reliable delivery under loss</b>: exact out-of-order byte accounting, retransmission of
+              unacknowledged data, and re-acknowledgement of already-received segments so senders do not stall.</li></ul></div>
+        <div class="card alt"><h3>Validation strategy</h3><ul>
+          <li><b>Offline unit &amp; randomized fuzz tests</b> drive the TCP reassembler directly under loss, reordering,
+              duplication, stale replays and corruption — the delivered byte stream must match exactly.</li>
+          <li><b>DPI coverage test</b>: every blocking rule must detect its own signature; realistic traffic and random
+              uploads must not be blocked.</li>
+          <li><b>JA3 limiter test</b>, including parallel-worker safety.</li>
+          <li><b>End-to-end &amp; "torture" suite</b>: real clients (<code>curl</code>, <code>wrk</code>, browsers) traverse
+              Aethon → nginx → a Node.js application under injected packet loss, reordering, slowloris, aborted
+              transfers and spoofed SYN floods.</li>
+          <li><b>Per-reason event counters</b> report exactly why any connection was reset or dropped.</li>
+          <li>Everything runs from a single command: <code>tests/run_all.sh</code>.</li></ul></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 5 — RESULTS -->
+  <section class="slide" id="s5">
+    <div class="sheet">
+      <div class="head"><span class="secno">05 — Results</span><span class="brandmini">Measured, with honest caveats</span></div>
+      <h2>Correctness demonstrated with real clients</h2>
+      <div class="grid g2">
+        <div class="card"><h3>Functional correctness</h3><ul>
+          <li><span class="ok">PASS</span> — byte-exact 5–20 MB transfers over both HTTP and HTTPS through the full stack.</li>
+          <li><span class="ok">PASS</span> — the same transfers under injected <b>50 ms delay and 2% packet loss</b>.</li>
+          <li><span class="ok">PASS</span> — survives slowloris, TLS handshake floods and <b>spoofed SYN floods</b> (SYN cookies hold) while continuing to serve legitimate clients.</li>
+          <li><span class="ok">PASS</span> — deep-packet-inspection blocks malicious payloads even when split across packets or TLS records.</li>
+          <li><span class="ok">PASS</span> — memory remains bounded across heavy connection churn.</li></ul></div>
+        <div class="card"><h3>Throughput — illustrative, not production</h3>
+          <div class="stat">
+            <div class="box"><div class="num">~110k</div><div class="lbl">requests/s through Aethon (static page)</div></div>
+            <div class="box"><div class="num">~104k</div><div class="lbl">requests/s, nginx direct (baseline)</div></div>
+            <div class="box"><div class="num">~111 MB</div><div class="lbl">resident memory after load</div></div>
+          </div>
+          <p class="small muted" style="margin-top:10px">Measured on a laptop over a virtual (veth) link in generic
+            XDP / copy mode. These are <b>not</b> real-NIC numbers; they show Aethon is not the bottleneck at
+            ~100k req/s, not that it is faster than nginx. Native zero-copy benchmarking on real hardware is future work.</p>
+        </div>
+      </div>
+      <p class="lead">Overall, Aethon demonstrates a <b>working userspace TCP + TLS data path serving real clients</b>
+        — not hand-crafted test packets — with correct behaviour under adversarial and lossy conditions.</p>
+    </div>
+  </section>
+
+  <!-- 6 — REMAINING / ROADMAP -->
+  <section class="slide" id="s6">
+    <div class="sheet">
+      <div class="head"><span class="secno">06 — Remaining Work &amp; Roadmap</span><span class="brandmini">Toward production</span></div>
+      <h2>Known limitations and a prioritised path forward</h2>
+      <div class="grid g2">
+        <div class="card"><h3>Current limitations</h3><ul>
+          <li><b>IPv4 only</b> — IPv6 is currently passed to the kernel without inspection.</li>
+          <li><b>No SACK or window scaling</b> — correct, but throughput is limited on long-distance, lossy links.</li>
+          <li><b>TLS handshakes and logging run on the packet thread</b> — a handshake flood can stall the queue.</li>
+          <li><b>No global memory budget or fail-open</b> — operational safety features not yet built.</li>
+          <li><b>Benchmarked on veth, not on a physical NIC.</b></li></ul></div>
+        <div class="card alt"><h3>Roadmap, by priority</h3><ul>
+          <li><b class="bad">P0</b> — fail-open on crash (systemd unit that detaches XDP), a global memory budget, and a monitor-only mode.</li>
+          <li><b class="warn">P1</b> — real-NIC loss testing, hot-reload of certificates and config, and moving TLS handshakes off the packet thread.</li>
+          <li><b class="teal">P2</b> — SACK and window scaling, native zero-copy on real hardware, and a full p50/p99/p99.9 benchmark against nginx and Suricata.</li>
+          <li><b class="muted">P3</b> — asynchronous logging, Prometheus metrics, and fuzzing with sanitizers in CI.</li></ul></div>
+      </div>
+      <div class="card alt">
+        <h3>Planned — Central Control Dashboard</h3>
+        <p class="small" style="margin:0 0 6px">A web-based control plane to <b>monitor, configure and control</b>
+          the entire engine from one place, instead of editing files and restarting:</p>
+        <ul style="margin:0">
+          <li><b>Monitor</b> — live throughput, latency, session counts, memory, and the per-reason reset/drop
+              event counters, with alerts.</li>
+          <li><b>Configure</b> — manage protected services, DPI rule sets, SNI/JA3 policy and rate limits, with
+              hot-reload (no restart, no dropped connections).</li>
+          <li><b>Control</b> — start/stop and attach/detach XDP, switch monitor-only vs. blocking mode, and block
+              or unblock an IP or fingerprint in one click.</li>
+        </ul>
+      </div>
+      <p class="small muted" style="text-align:center">Group No. 7 · IIT Mandi · Thank you</p>
+    </div>
+  </section>
+
+</div>
+
+<footer class="bar">
+  <span class="mono">AETHON · Group&nbsp;7</span>
+  <span id="pos">01 / 06</span>
+  <div class="dots" id="dots" aria-label="slides"></div>
+  <span>←&nbsp;→ / scroll</span>
+</footer>
+
+<script>
+(function(){
+  var deck=document.getElementById('deck');
+  var slides=[].slice.call(document.querySelectorAll('.slide'));
+  var dots=document.getElementById('dots');
+  var pos=document.getElementById('pos');
+  var cur=0;
+  slides.forEach(function(s,i){
+    var b=document.createElement('button');
+    b.setAttribute('aria-label','Go to slide '+(i+1));
+    b.addEventListener('click',function(){slides[i].scrollIntoView();});
+    dots.appendChild(b);
+  });
+  function setActive(i){
+    cur=i;
+    pos.textContent=('0'+(i+1)).slice(-2)+' / '+('0'+slides.length).slice(-2);
+    [].forEach.call(dots.children,function(d,j){d.setAttribute('aria-current', j===i?'true':'false');});
+  }
+  if('IntersectionObserver' in window){
+    var io=new IntersectionObserver(function(es){
+      es.forEach(function(e){ if(e.isIntersecting) setActive(slides.indexOf(e.target)); });
+    },{root:deck,threshold:0.55});
+    slides.forEach(function(s){io.observe(s);});
+  }
+  document.addEventListener('keydown',function(e){
+    if(['ArrowRight','ArrowDown','PageDown',' '].indexOf(e.key)>-1){e.preventDefault(); if(cur<slides.length-1) slides[cur+1].scrollIntoView();}
+    else if(['ArrowLeft','ArrowUp','PageUp'].indexOf(e.key)>-1){e.preventDefault(); if(cur>0) slides[cur-1].scrollIntoView();}
+  });
+  setActive(0);
+})();
+</script>
+</body>
+</html>

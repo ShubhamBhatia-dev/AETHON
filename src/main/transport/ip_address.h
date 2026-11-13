@@ -9,6 +9,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 namespace aethon {
 
@@ -147,7 +148,30 @@ AETHON_ALWAYS_INLINE bool is_valid_tcp_checksum(const struct iphdr *__restrict__
   acc = (acc & 0xFFFF) + (acc >> 16);
   acc = (acc & 0xFFFF) + (acc >> 16);
   acc = (acc & 0xFFFF) + (acc >> 16);
-  return static_cast<uint16_t>(acc) == 0xFFFF;
+  if (static_cast<uint16_t>(acc) == 0xFFFF) {
+    return true;
+  }
+
+  // Handle hardware / virtual NIC checksum offload (CHECKSUM_PARTIAL):
+  // When offloaded by the sending kernel (e.g. veth, virtio-net, or NIC with TX offload),
+  // tcph->check contains the pseudo-header checksum (~ph_csum) or 0.
+  if (segment_len >= sizeof(struct tcphdr)) {
+    const auto *tcph = reinterpret_cast<const struct tcphdr *>(segment);
+    if (tcph->check == 0) return true;
+
+    uint64_t ph = static_cast<uint64_t>(iph->saddr) + iph->daddr +
+                  htons(static_cast<uint16_t>(IPPROTO_TCP)) +
+                  htons(static_cast<uint16_t>(segment_len));
+    ph = (ph & 0xFFFFFFFF) + (ph >> 32);
+    ph = (ph & 0xFFFF) + (ph >> 16);
+    ph = (ph & 0xFFFF) + (ph >> 16);
+    uint16_t ph_csum = ~static_cast<uint16_t>(ph);
+    if (tcph->check == ph_csum || tcph->check == __builtin_bswap16(ph_csum)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 }; // namespace Ipv4
 }; // namespace aethon

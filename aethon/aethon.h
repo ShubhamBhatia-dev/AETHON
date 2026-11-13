@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <linux/futex.h>
 
+#ifndef AETHON_SAFE_WRITE_ALL_DEFINED
+#define AETHON_SAFE_WRITE_ALL_DEFINED
 inline void safe_write_all() {}
 
 template <typename... Rest>
@@ -19,6 +21,7 @@ inline void safe_write_all(const char *str, Rest... rest) {
   }
   safe_write_all(rest...);
 }
+#endif
 
 #define AETHON_SAFE_CHECK(expr, ...)                                           \
   do {                                                                         \
@@ -35,6 +38,8 @@ inline void safe_write_all(const char *str, Rest... rest) {
 #define AETHON_PAUSE_CPU_INSTRUCTION
 #endif
 
+#ifndef AETHON_OS_CONSTS_DEFINED
+#define AETHON_OS_CONSTS_DEFINED
 #ifdef _MSC_VER
 constexpr auto kMscVer = _MSC_VER;
 #else
@@ -45,6 +50,7 @@ constexpr auto kMscVer = 0;
 constexpr bool kIsLinux = true;
 #else
 constexpr bool kIsLinux = false;
+#endif
 #endif
 
 #ifdef __GNUC__
@@ -193,6 +199,8 @@ struct Buffer {
 #define AETHON_ATTR_GNU_COLD
 #endif
 
+#ifndef AETHON_TRAITS_DEFINED
+#define AETHON_TRAITS_DEFINED
 namespace Trait {
 
 template <typename...> inline constexpr bool always_false = false;
@@ -224,7 +232,10 @@ template <typename T> inline constexpr bool is_unbounded_array_v = false;
 template <typename T> inline constexpr bool is_unbounded_array_v<T[]> = true;
 
 } // namespace Trait
+#endif // AETHON_TRAITS_DEFINED
 
+#ifndef AETHON_IMPLEMENTATION_DEFINED
+#define AETHON_IMPLEMENTATION_DEFINED
 namespace implementation {
 
 // if the value at memory adrr adrr is val put the thread to sleep until someone wakeup me
@@ -371,8 +382,12 @@ inline int factorial_tail(int n, int acc = 1) {
 }
 
 } // namespace implementation
+#endif // AETHON_IMPLEMENTATION_DEFINED
 
+#ifndef AETHON_VARIABLE_TEMPLATES_DEFINED
+#define AETHON_VARIABLE_TEMPLATES_DEFINED
 namespace variableTemplates {
 template <typename T> constexpr bool is_pointer = false;
 template <typename T> constexpr bool is_pointer<T *> = true;
 } // namespace variableTemplates
+#endif // AETHON_VARIABLE_TEMPLATES_DEFINED

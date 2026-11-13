@@ -14,6 +14,11 @@ else()
     set(BPF_ARCH_INCLUDE "")
 endif()
 
+include_directories(
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/log
+    ${CMAKE_CURRENT_SOURCE_DIR}/../extern/FluxIO/include
+)
+
 # Compile eBPF program
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/main/ebpf/xdp_kern_prog.o
@@ -35,6 +40,7 @@ target_include_directories(test_tls_engine PRIVATE
 )
 target_link_libraries(test_tls_engine PRIVATE 
     aethon::aethon 
+    FluxIO::fluxio
     OpenSSL::SSL 
     OpenSSL::Crypto 
     ${LIBHS_LIBRARIES}
@@ -51,6 +57,7 @@ target_include_directories(test_tcp_reassembly PRIVATE
 )
 target_link_libraries(test_tcp_reassembly PRIVATE
     aethon::aethon
+    FluxIO::fluxio
     OpenSSL::SSL
     OpenSSL::Crypto
     ${LIBHS_LIBRARIES}
@@ -104,6 +111,7 @@ target_include_directories(test_tcp_fuzz PRIVATE
 )
 target_link_libraries(test_tcp_fuzz PRIVATE
     aethon::aethon
+    FluxIO::fluxio
     OpenSSL::SSL
     OpenSSL::Crypto
     ${LIBHS_LIBRARIES}
@@ -120,6 +128,8 @@ target_include_directories(afxdp_control PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/main/tls
     ${CMAKE_CURRENT_SOURCE_DIR}/main/dpi
     ${CMAKE_CURRENT_SOURCE_DIR}/main/net
+    ${CMAKE_CURRENT_SOURCE_DIR}/main/log
+    ${CMAKE_CURRENT_SOURCE_DIR}/../extern/FluxIO/include
     ${CMAKE_CURRENT_SOURCE_DIR}/..
     ${LIBXDP_INCLUDE_DIRS} 
     ${LIBBPF_INCLUDE_DIRS}
@@ -128,6 +138,7 @@ target_include_directories(afxdp_control PRIVATE
 target_link_libraries(afxdp_control PRIVATE 
     aethon::aethon 
     CLI11::CLI11 
+    FluxIO::fluxio
     ${LIBXDP_LIBRARIES} 
     ${LIBBPF_LIBRARIES} 
     ${LIBHS_LIBRARIES}

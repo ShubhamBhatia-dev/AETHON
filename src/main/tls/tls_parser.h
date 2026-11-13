@@ -79,8 +79,39 @@ string)
 
 */
 
+
+
+
+
+// more better representation
+
+/*
+Byte Offset | Field Name                 | Size     | Meaning in our code
+------------|----------------------------|----------|---------------------------------------
+0           | Content Type               | 1 byte   | 0x16 = Handshake
+1 - 2       | Legacy Record Version      | 2 bytes  | 0x0301 (TLS 1.0) or 0x0303 (TLS 1.2/1.3)
+3 - 4       | Record Length              | 2 bytes  | uint16 length of following record
+------------|----------------------------|----------|---------------------------------------
+5           | Handshake Type             | 1 byte   | 0x01 = ClientHello
+6 - 8       | Handshake Length           | 3 bytes  | 24-bit uint length of ClientHello body
+9 - 10      | Client Version             | 2 bytes  | 0x0303 (771) -> used for JA3
+11 - 42     | Client Random Nonce        | 32 bytes | 32 random bytes for crypto keys
+43          | Session ID Length (L1)     | 1 byte   | 0 to 32 bytes
+44 .. 44+L1 | Session ID Data            | L1 bytes | Session resumption ID
+------------|----------------------------|----------|---------------------------------------
+Next 2 bytes| Cipher Suites Length (L2)  | 2 bytes  | uint16 length of cipher suite list
+Next L2 B   | Cipher Suite IDs           | L2 bytes | 2 bytes per cipher suite (e.g. 0x1301)
+------------|----------------------------|----------|---------------------------------------
+Next 1 byte | Compression Length (L3)    | 1 byte   | Usually 1 byte (0x00 for null)
+Next L3 B   | Compression Methods        | L3 bytes | Compression algorithms
+------------|----------------------------|----------|---------------------------------------
+Next 2 bytes| Extensions Total Length    | 2 bytes  | uint16 length of all extensions
+Following   | Extension TLV list         | Variable | Type (2B), Length (2B), Value (Length B)
+
+*/
 #pragma once
 #include "aethon/aethon.h"
+#include "config/constants.h"
 #include <arpa/inet.h>
 #include <cstddef>
 #include <cstdint>
@@ -89,14 +120,14 @@ string)
 
 namespace aethon::tls {
 
-inline constexpr uint8_t TLS_RECORD_HANDSHAKE = 0x16;
-inline constexpr uint8_t TLS_RECORD_APPLICATION_DATA = 0x17;
-inline constexpr uint8_t TLS_HANDSHAKE_CLIENT_HELLO = 0x01;
-inline constexpr uint16_t TLS_EXT_SERVER_NAME = 0x0000;
-inline constexpr uint16_t TLS_EXT_SUPPORTED_GROUPS = 0x000A;
-inline constexpr uint16_t TLS_EXT_EC_POINT_FORMATS = 0x000B;
-inline constexpr uint8_t TLS_SNI_HOST_NAME = 0x00;
-constexpr int MAX_JA3_HASH_STRING=2000;
+inline constexpr uint8_t TLS_RECORD_HANDSHAKE = config::tls::RECORD_HANDSHAKE;
+inline constexpr uint8_t TLS_RECORD_APPLICATION_DATA = config::tls::RECORD_APPLICATION_DATA;
+inline constexpr uint8_t TLS_HANDSHAKE_CLIENT_HELLO = config::tls::HANDSHAKE_CLIENT_HELLO;
+inline constexpr uint16_t TLS_EXT_SERVER_NAME = config::tls::EXT_SERVER_NAME;
+inline constexpr uint16_t TLS_EXT_SUPPORTED_GROUPS = config::tls::EXT_SUPPORTED_GROUPS;
+inline constexpr uint16_t TLS_EXT_EC_POINT_FORMATS = config::tls::EXT_EC_POINT_FORMATS;
+inline constexpr uint8_t TLS_SNI_HOST_NAME = config::tls::SNI_HOST_NAME;
+constexpr int MAX_JA3_HASH_STRING = config::tls::MAX_JA3_HASH_STRING;
 
 struct JA3{
   char ja3_str[MAX_JA3_HASH_STRING]{};

@@ -10,14 +10,14 @@ Legend: **[P0]** must-have before any real deployment · **[P1]** needed for a d
 
 ## P0 — Safety before it ever faces real traffic
 
-- [ ] **Fail-open on crash.** If `afxdp_control` dies, XDP keeps redirecting to a dead socket and
+- [x] **Fail-open on crash.** If `afxdp_control` dies, XDP keeps redirecting to a dead socket and
       the site goes dark. Ship a systemd unit with `Restart=always` and
-      `ExecStopPost=/sbin/ip link set dev <iface> xdp off`, plus a watchdog. Verify: `kill -9`
-      the process and confirm traffic still flows through the kernel.
-- [ ] **Global memory budget.** Per-session buffers are capped, but nothing bounds *total* memory.
-      A slow-read / many-connection attack can still OOM the host. Add a per-worker byte budget
+      `ExecStopPost=/sbin/ip link set dev <iface> xdp off`, plus a watchdog. Native systemd watchdog
+      heartbeats (`WATCHDOG=1`, `READY=1`) over `NOTIFY_SOCKET` integrated.
+- [x] **Global memory budget.** Per-session buffers are capped, but nothing bounds *total* memory.
+      A slow-read / many-connection attack can still OOM the host. Added a per-worker byte budget
       (≈ 40% RAM / workers); when exceeded: advertise zero window, stop reading backends, refuse
-      new SYNs, evict oldest idle sessions. Test with `slowhttptest` while watching RSS.
+      new SYNs, evict oldest idle sessions. Verified in test suite.
 - [ ] **Deploy in monitor-only mode first.** A config switch to log what *would* be blocked
       without resetting connections, so a false-positive rule can't take the site down on day one.
 - [ ] **Bind backends to 127.0.0.1 and document it.** If a backend listens on 0.0.0.0 clients can
@@ -29,14 +29,17 @@ Legend: **[P0]** must-have before any real deployment · **[P1]** needed for a d
 - [ ] **TCP retransmission edge cases under real loss.** Retransmit queue, RTO and fast-retransmit
       exist; validate SACK-less recovery over `tc netem loss 10% reorder` on a *real* NIC, not just
       veth. Add a soak test (hours) and watch the `[Events]` counters.
-- [ ] **ICMP to the kernel.** Currently only echo is handled in userspace; other ICMP types are
-      dropped, which breaks path-MTU discovery. Pass all ICMP via `XDP_PASS` (or handle PMTU).
+- [x] **ICMP to the kernel & Path-MTU Discovery (RFC 1191).** eBPF fast passes non-echo ICMP
+      to Linux kernel via `XDP_PASS`. Userspace parses ICMP Type 3 Code 4 (Fragmentation Needed),
+      dynamically updates active TCP session MSS (`session->params.mss`) & Reno congestion control
+      (`session->cc.mss`), and forwards unhandled ICMP to Linux kernel stack via TAP (`aethon0`).
 - [ ] **TLS handshakes off the packet thread.** A handshake does ~1 ms of asymmetric crypto on the
       worker; a ClientHello flood stalls the queue. Move handshakes to a small worker pool or add a
       per-IP handshake rate limit. (SYN cookies and JA3 limiting already exist as first lines.)
-- [ ] **Certificate & config reload without downtime.** Reload `services.conf`, `blocked_domains`,
-      rules and certs on `SIGHUP` instead of a restart that drops every connection. Add ACME/
-      Let's Encrypt renewal handling.
+- [x] **Certificate & config reload without downtime (SIGHUP).** Thread-safe double-buffered
+      `ServiceRegistryHolder` reloads `services.conf`, certificates, and `blocked_domains` on
+      `SIGHUP` / `systemctl reload aethon`. Parses draft without dropping active TCP connections,
+      and dynamically updates eBPF `aethon_services_map`.
 - [ ] **Stronger ISN / SYN-cookie secret rotation.** SipHash keys are random at startup; rotate the
       cookie secret on a timer and keep the previous one valid for one window.
 - [ ] **IPv6.** Today IPv6 is passed to the kernel uninspected. Either document it as out of scope
@@ -44,9 +47,12 @@ Legend: **[P0]** must-have before any real deployment · **[P1]** needed for a d
 
 ## P2 — Performance & protocol completeness
 
-- [ ] **Window scaling + SACK.** Capped at 64 KB in flight today, so throughput collapses on
-      long-RTT or lossy links. Negotiate window scale in the SYN-ACK (options already parsed) and
-      implement SACK for fast loss recovery.
+- [x] **SACK loss recovery.** Negotiate SACK-Permitted (RFC 2018) in the SYN-ACK, parse SACK
+      Option Kind 5 blocks from client ACKs, and perform selective fast retransmission skipping
+      already-acknowledged chunks.
+- [x] **Window scaling (RFC 7323).** Negotiate window scale in the SYN-ACK (server shift 7,
+      allowing up to ~8.4 MB window). Parse client shift count clamped to max 14, scale outbound
+      `snd_wnd` on client ACKs, and downshift outbound receive window advertisements.
 - [ ] **Native-mode zero-copy on a real NIC.** Currently generic XDP + copy mode. Get
       `XDP_MODE_NATIVE` + `XDP_ZEROCOPY` working on real hardware (ena/ixgbe/i40e/mlx5) and keep the
       README's claims conditional on what actually succeeds.

@@ -6,6 +6,7 @@
 #include <cstring>
 #include "aethon/aethon.h"
 #include "aethon/single_thread_hasmap.h"
+#include "config/constants.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <new>
@@ -31,17 +32,14 @@
 */
 namespace aethon {
 namespace UDPIpv4Assembler {
-static constexpr std::size_t AETHON_MAX_IP_DATAGRAM_SIZE =
-    65535; // offset size max
-static constexpr std::size_t AETHON_MAX_ACTIVE_DGRAM_SESSIONS =
-    65536; // max no of concurrent udp connection to maintain
+static constexpr std::size_t AETHON_MAX_IP_DATAGRAM_SIZE = config::udp::MAX_IP_DATAGRAM_SIZE;
+static constexpr std::size_t AETHON_MAX_ACTIVE_DGRAM_SESSIONS = 65536; // max concurrent sessions
 
 // 64 kb packet contain at max around 45 fragment of size 1500 bytes 1MTU
 // an attack can send one 1 BYTE fragment to do more cpu operation
 
-static constexpr std::size_t AETHON_MAX_IP_DATAGRAM_FRAGMENT_PER_ID = 64;
-static constexpr std::size_t AETHON_DATAGRAM_REASSEMBLY_TIMEOUT_SEC =
-    10; // 10s timeout
+static constexpr std::size_t AETHON_MAX_IP_DATAGRAM_FRAGMENT_PER_ID = config::udp::MAX_FRAGMENTS_PER_ID;
+static constexpr std::size_t AETHON_DATAGRAM_REASSEMBLY_TIMEOUT_SEC = config::udp::REASSEMBLY_TIMEOUT_SEC;
 
 struct alignas(16) FragmentKey {
   uint32_t src_ip;

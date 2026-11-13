@@ -1,0 +1,49 @@
+[Unit]
+Description=Aethon High-Performance L4/L7 Kernel-Bypass Security Gateway
+Documentation=https://github.com/aethon-proxy/Aethon
+# Wait for network interface configuration and local filesystems before launching
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+WatchdogSec=5s
+TimeoutStartSec=15s
+
+# Load interface name and runtime arguments from environment file (defaults to eth0 if missing)
+EnvironmentFile=-/etc/aethon/aethon.env
+
+# Path to the compiled Aethon binary (configured via IFACE environment variable)
+ExecStart=/usr/local/bin/afxdp_control --iface ${IFACE}
+
+# Zero-Downtime Hot Reload: Reloads services.conf, certificates, and eBPF maps without dropping connections
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Automatic restart on any failure (crash, SIGSEGV, SIGABRT, kill -9)
+Restart=always
+RestartSec=1s
+
+# CRITICAL FAIL-OPEN DIRECTIVE:
+# Executed unconditionally if the process exits, dies, or is killed (SIGKILL / SIGSEGV).
+# Immediately detaches the eBPF/XDP program from the physical network interface so the
+# Linux kernel driver takes back packet routing and the server never goes dark!
+ExecStopPost=/sbin/ip link set dev ${IFACE} xdp off
+
+# High-Performance Resource Limits (crucial for AF_XDP and high-concurrency)
+# 1. Allow pinning arbitrary gigabytes of UMEM memory pages for zero-copy DMA:
+LimitMEMLOCK=infinity
+# 2. Max open file descriptors for backend sockets:
+LimitNOFILE=1048576
+# 3. Maximum real-time scheduling priority:
+LimitRTPRIO=99
+# 4. Round-Robin real-time kernel scheduling policy to eliminate CPU jitter:
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=99
+
+# Sandbox & Security Hardening for the daemon itself
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

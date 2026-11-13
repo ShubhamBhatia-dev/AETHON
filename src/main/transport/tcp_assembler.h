@@ -62,10 +62,25 @@ Kind = 0 (TCPOPT_EOL): End of options list. Stop parsing immediately!
 Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 byte.
 
 */
+
+/*
+
+SACK OPTION WIRED FORM
+
+ Byte 0       Byte 1       Byte 2..5         Byte 6..9         Byte 10..13       Byte 14..17
++-----------+------------+-----------------+-----------------+-----------------+-----------------+
+| Kind = 5  | Length = L | Left Edge 1     | Right Edge 1    | Left Edge 2     | Right Edge 2    |
+| (1 byte)  | (1 byte)   | (4 bytes)       | (4 bytes)       | (4 bytes)       | (4 bytes)       |
++-----------+------------+-----------------+-----------------+-----------------+-----------------+
+                         |<------ 1st SACK Block ------->| |<------ 2nd SACK Block ------->|
+                         |<------------------------ 8 bytes ------------------------------>|
+
+*/
 #pragma once
 #include <hs/hs.h>
 #include <vector>
 #include "aethon/aethon.h"
+#include "config/constants.h"
 #include "tcp_congestion.h"
 #include "event_counters.h"
 #include "udp_assembler.h"
@@ -97,6 +112,8 @@ Kind = 1 (TCPOPT_NOP): No-operation (1 byte of padding for alignment). Skip 1 by
 #include <sys/types.h>
 #include <unistd.h>
 #include <poll.h>
+#include "allocator/memory_budget.h"
+
 namespace aethon {
     namespace IPv4TcpAssembler {
         enum class TcpState : uint8_t{
@@ -164,7 +181,9 @@ namespace aethon {
 
         struct TcpNegotiatedParams{
             uint16_t mss{1460}; // mtu
-            uint8_t wscale {0}; // window scaler factor
+            uint8_t  client_wscale{0}; 
+            uint8_t  server_wscale{0};
+            bool     wscale_enabled{false}; 
             bool sack_permitted{false};
         };
 
@@ -207,10 +226,12 @@ namespace aethon {
                         break;
                         
                     case TCPOPT_WINDOW: // kind 3 window scale (length = 3)
-                        // RFC 7323 Section 2.2: Window scale is only enabled if negotiated in BOTH
-                        // SYN and SYN-ACK. Since Aethon's SYN-ACK does not include TCPOPT_WINDOW,
-                        // window scaling must remain disabled (wscale = 0).
-                        out_params.wscale = 0;
+                        if(AETHON_LIKELY(len == TCPOLEN_WINDOW)){
+                            out_params.wscale_enabled = true;
+                            // RFC 7323 Section 2.3: Shift counts > 14 are invalid; clamp to 14
+                            out_params.client_wscale =  std::min<uint8_t>(*(opt + 2), 14);
+                            out_params.server_wscale = 7;
+                        }
                         break;
                     
                     case TCPOPT_SACK_PERMITTED:
@@ -229,18 +250,17 @@ namespace aethon {
 
         }
 
-        
-        static constexpr size_t AETHON_MAX_ACTIVE_TCP_SESSION = 65536;
-        static constexpr size_t AETHON_TCP_WINDOW_SIZE = 65536;
-        static constexpr size_t AETHON_TCP_BITMAP_WORDS        = AETHON_TCP_WINDOW_SIZE / 64; 
-        static constexpr uint64_t AETHON_TCP_SYN_TIMEOUT_NS    = 3ULL * 1000000000ULL;
+        static constexpr size_t AETHON_MAX_ACTIVE_TCP_SESSION = config::tcp::MAX_ACTIVE_TCP_SESSION;
+        static constexpr size_t AETHON_TCP_WINDOW_SIZE = config::tcp::TCP_WINDOW_SIZE;
+        static constexpr size_t AETHON_TCP_BITMAP_WORDS        = config::tcp::TCP_BITMAP_WORDS; 
+        static constexpr uint64_t AETHON_TCP_SYN_TIMEOUT_NS    = config::tcp::SYN_TIMEOUT_NS;
         // Longer than common backend keep-alive timeouts (nginx: 65 s), so idle keep-alive
         // connections are closed cleanly by the backend (FIN) before Aethon forgets them.
-        static constexpr uint64_t AETHON_TCP_ESTAB_TIMEOUT_NS  = 120ULL * 1000000000ULL;
-        static constexpr uint64_t AETHON_TCP_TIMEWAIT_TIMEOUT_NS = 10ULL * 1000000000ULL;  // half-closed / FIN'd
+        static constexpr uint64_t AETHON_TCP_ESTAB_TIMEOUT_NS  = config::tcp::ESTAB_TIMEOUT_NS;
+        static constexpr uint64_t AETHON_TCP_TIMEWAIT_TIMEOUT_NS = config::tcp::TIMEWAIT_TIMEOUT_NS;  // half-closed / FIN'd
         // Above this many sessions per worker, new SYNs are answered with SYN cookies
         // (no state until the client completes the handshake).
-        static constexpr size_t AETHON_SYNCOOKIE_THRESHOLD = AETHON_MAX_ACTIVE_TCP_SESSION / 4;
+        static constexpr size_t AETHON_SYNCOOKIE_THRESHOLD = config::tcp::SYNCOOKIE_THRESHOLD;
 
 
         struct TcpStreamSession;
@@ -256,6 +276,8 @@ namespace aethon {
             size_t payload_len{0};
             TcpStreamSession *session{nullptr};
             hs_stream_t *hs_stream{nullptr};
+            hs_stream_t *custom_hs_stream{nullptr};
+            uint64_t custom_hs_gen{0};
             bool fast_retransmit{false};
             bool syn_cookie{false};          // answer this SYN statelessly with ISN = syn_cookie_isn
             uint32_t syn_cookie_isn{0};
@@ -263,7 +285,77 @@ namespace aethon {
             bool overlap_violation{false};   // session killed: retransmission contradicts buffered data
         };
 
-        
+        /**
+         * @brief Zero-overhead O(1) TCP Outbound Send Buffer
+         * 
+         * Eliminates O(n^2) std::vector::erase(begin()) front-shifting memmove on every ACK.
+         * Uses an O(1) head offset and compacts only amortized when the head passes half
+         * the buffer and >= 128 KB, maintaining wire-rate memory efficiency without cache thrashing.
+         */
+        class alignas(16) TcpSendBuffer {
+        private:
+            std::vector<uint8_t> buf_;
+            size_t head_{0};
+
+        public:
+            TcpSendBuffer() noexcept = default;
+
+            AETHON_ALWAYS_INLINE size_t size() const noexcept {
+                return (buf_.size() > head_) ? (buf_.size() - head_) : 0;
+            }
+
+            AETHON_ALWAYS_INLINE bool empty() const noexcept {
+                return size() == 0;
+            }
+
+            AETHON_ALWAYS_INLINE const uint8_t* data() const noexcept {
+                return buf_.data() + head_;
+            }
+
+            AETHON_ALWAYS_INLINE uint8_t* data() noexcept {
+                return buf_.data() + head_;
+            }
+
+            AETHON_ALWAYS_INLINE void append(const uint8_t* data, size_t len) {
+                if (!data || len == 0) return;
+                // If head has advanced significantly, compact to recycle capacity
+                if (head_ > 0 && (head_ >= 131072 || head_ >= buf_.size() / 2)) {
+                    compact();
+                }
+                buf_.insert(buf_.end(), data, data + len);
+            }
+
+            AETHON_ALWAYS_INLINE void consume(size_t bytes) noexcept {
+                head_ += bytes;
+                if (head_ >= buf_.size()) {
+                    clear();
+                } else if (head_ >= 131072 && head_ >= buf_.size() / 2) {
+                    compact();
+                }
+            }
+
+            AETHON_ALWAYS_INLINE void clear() noexcept {
+                buf_.clear();
+                head_ = 0;
+            }
+
+            AETHON_ALWAYS_INLINE void compact() noexcept {
+                if (head_ == 0) return;
+                size_t remaining = buf_.size() - head_;
+                if (remaining > 0) {
+                    std::memmove(buf_.data(), buf_.data() + head_, remaining);
+                    buf_.resize(remaining);
+                } else {
+                    buf_.clear();
+                }
+                head_ = 0;
+            }
+
+            AETHON_ALWAYS_INLINE size_t capacity_bytes() const noexcept {
+                return buf_.capacity();
+            }
+        };
+
         struct alignas(implementation::hardware_destructive_interference_size)
         TcpStreamSession{
             TcpKey key{KemptyTcpKey};
@@ -286,7 +378,8 @@ namespace aethon {
 
             int backend_fd {-1};
             uint16_t backend_port {0};
-            static constexpr size_t MAX_BACKEND_BUF = 256 * 1024;
+            bool is_http{false};
+            static constexpr size_t MAX_BACKEND_BUF = config::tcp::MAX_BACKEND_BUF;
             std::vector<uint8_t> backend_tx_buf;
             bool epollout_armed{false};
             bool backend_epollin_disabled{false};
@@ -300,10 +393,10 @@ namespace aethon {
             // Outbound TCP Reliability State
             uint32_t snd_una{0};                       // Oldest unacknowledged sequence number
             uint32_t snd_wnd{65535};                   // Client's advertised receive window (starts at 64 KB)
-            static constexpr size_t MAX_SND_BUF = 256 * 1024; // 256 KB max in-flight
-            std::vector<uint8_t> snd_buf;              // Data in-flight or waiting to be sent
+            static constexpr size_t MAX_SND_BUF = config::tcp::MAX_SND_BUF;
+            TcpSendBuffer snd_buf;                     // O(1) Data in-flight or waiting to be sent
             uint64_t last_tx_time_ns{0};               // Timestamp of last transmission
-            uint32_t rto_ms{1000};                     // RTO in milliseconds (RFC 6298: 1s initial)
+            uint32_t rto_ms{config::tcp::INITIAL_RTO_MS}; // RTO in milliseconds (RFC 6298: 1s initial)
             uint8_t retransmit_count{0};               // Number of retransmissions
 
             // RFC 6298: Dynamic RTT and RTO estimation (Jacobson's Algorithm)
@@ -346,17 +439,50 @@ namespace aethon {
             AETHON_ALWAYS_INLINE uint16_t recv_window() const noexcept {
                 // Undecrypted TLS bytes are already ACKed but not yet in backend_tx_buf; count them,
                 // otherwise a burst of completed records can overflow MAX_BACKEND_BUF (-> RST)
+
+                if(AETHON_UNLIKELY(budget && budget->is_over_budget())){
+                    return 0;
+                }
+
                 size_t used = backend_tx_buf.size() + tls_conn.pending_input();
                 if (used >= MAX_BACKEND_BUF) return 0;
                 size_t remaining = MAX_BACKEND_BUF - used;
+                if (params.wscale_enabled && params.server_wscale > 0) {
+                    remaining >>= params.server_wscale;
+                }
                 return static_cast<uint16_t>(std::min<size_t>(65535, remaining));
             }
 
             hs_stream_t *hs_stream{nullptr};
+            hs_stream_t *custom_hs_stream{nullptr};
+            uint64_t custom_hs_gen{0};
 
             uint8_t client_mac[6]{0};
             uint8_t server_mac[6]{0};
             uint32_t send_nxt{0};
+
+
+            WorkerMemoryBudget *budget{nullptr};
+
+            struct SackBlock{
+                uint32_t left_edge{0};
+                uint32_t right_edge{0};
+            };
+
+            static constexpr size_t MAX_SACK_BLOCKS = config::tcp::MAX_SACK_BLOCKS;
+            std::array<SackBlock, MAX_SACK_BLOCKS> client_sack_blocks{};
+            uint8_t num_sack_blocks{0};
+
+            // check if a sequence number was already received by the client
+            AETHON_ALWAYS_INLINE bool is_sacked(uint32_t seq) const noexcept {
+                for (uint8_t i = 0; i < num_sack_blocks; ++i) {
+                    if (TcpSeq::gte(seq, client_sack_blocks[i].left_edge) &&
+                        TcpSeq::lt(seq, client_sack_blocks[i].right_edge)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
 
             std::vector<uint8_t> client_hello_buf;
             bool app_data_seen{false};      // first in-order payload byte already processed
@@ -375,6 +501,14 @@ namespace aethon {
                     hs_close_stream(hs_stream, nullptr, nullptr, nullptr);
                     hs_stream = nullptr;
                 }
+                if(custom_hs_stream){
+                    hs_close_stream(custom_hs_stream, nullptr, nullptr, nullptr);
+                    custom_hs_stream = nullptr;
+                }
+
+                 if (budget) {
+                        budget->deallocate(snd_buf.size() + backend_tx_buf.size() + client_hello_buf.size());
+                    }
             }
             TcpStreamSession(const TcpStreamSession &) = delete;
             TcpStreamSession &operator=(const TcpStreamSession &) = delete;
@@ -429,13 +563,17 @@ namespace aethon {
 
                     backend_tx_buf.clear();
 
+                    // sock stream tcp connection SOCK_NONBLOCK --> any operation on this sockets returns immediately
                     backend_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
                     if(backend_fd < 0){
                         return false;
                     }
 
                     int one = 1;
+                    //  TCP_NODELAY send packets immediately as soon as we write to the socket
                     setsockopt(backend_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+                    struct linger sl = {1, 0};
+                    setsockopt(backend_fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
                     struct sockaddr_in sin {};
                     sin.sin_family  = AF_INET;
                     sin.sin_port = htons(target_port);
@@ -461,6 +599,8 @@ namespace aethon {
                     return true;
                 }
 
+                // MSG_DONTWAIT : Guarantees non-blocking 
+                // MSG_NOSIGNAL : if the backend server crashed prevenr linux from raising a SIGPIPE signal which would kill our entire process
                 ssize_t sent = ::send(backend_fd, data, len, MSG_DONTWAIT | MSG_NOSIGNAL);
                 if(sent < 0){
                     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINPROGRESS) {
@@ -633,6 +773,45 @@ namespace aethon {
 
         };
 
+        AETHON_ALWAYS_INLINE static void parse_tcp_ack_options(
+            const struct tcphdr * __restrict__ tcph,
+            TcpStreamSession * __restrict__ session
+        ) noexcept {
+            const size_t tcp_hdr_len = tcph->doff * 4;
+            if (AETHON_LIKELY(tcp_hdr_len <= sizeof(struct tcphdr) || !session->params.sack_permitted)) {
+                return;
+            }
+
+            const uint8_t *opt = reinterpret_cast<const uint8_t *>(tcph) + sizeof(struct tcphdr);
+            const uint8_t *end = reinterpret_cast<const uint8_t *>(tcph) + tcp_hdr_len;
+
+            while (opt < end) {
+                const uint8_t kind = *opt;
+                if (kind == TCPOPT_EOL) break;
+                if (kind == TCPOPT_NOP) {
+                    ++opt;
+                    continue;
+                }
+
+                if (AETHON_UNLIKELY(opt + 1 >= end)) break;
+                const uint8_t len = *(opt + 1);
+                if (AETHON_UNLIKELY(len < 2 || opt + len > end)) break;
+
+                // Kind 5: SACK option (RFC 2018)
+                if (kind == 5 && (len - 2) % 8 == 0) {
+                    uint8_t num_blocks = static_cast<uint8_t>((len - 2) / 8);
+                    session->num_sack_blocks = std::min<uint8_t>(num_blocks, TcpStreamSession::MAX_SACK_BLOCKS);
+                    const uint8_t *block_ptr = opt + 2;
+                    for (uint8_t i = 0; i < session->num_sack_blocks; ++i) {
+                        session->client_sack_blocks[i].left_edge = ntohl(*reinterpret_cast<const uint32_t *>(block_ptr));
+                        session->client_sack_blocks[i].right_edge = ntohl(*reinterpret_cast<const uint32_t *>(block_ptr + 4));
+                        block_ptr += 8;
+                    }
+                }
+
+                opt += len;
+            }
+        }
 
         class alignas(implementation::hardware_destructive_interference_size)
         TcpAssemblerEngine{
@@ -645,10 +824,11 @@ namespace aethon {
 
                  uint64_t last_cleanup_ns_{0};
                  ReassemblyBufferPool reassembly_pool_;
+                 WorkerMemoryBudget budget_;
                  // SYN cookie secret (per worker; a flow always returns to the same worker)
                  uint64_t cookie_k0_{0};
                  uint64_t cookie_k1_{0};
-                 static constexpr uint64_t kCookieSlotNs = 64ULL * 1000000000ULL;   // 64 s time slots
+                 static constexpr uint64_t kCookieSlotNs = config::tcp::COOKIE_SLOT_NS;   // 64 s time slots
 
                  static AETHON_ALWAYS_INLINE uint64_t rotl(uint64_t x, int b) noexcept {
                      return (x << b) | (x >> (64 - b));
@@ -692,6 +872,9 @@ namespace aethon {
 
                 // Cookie layout: [5 bits time slot][27 bits SipHash MAC of 4-tuple + client ISN + slot]
                 AETHON_ALWAYS_INLINE uint32_t make_syn_cookie(const TcpKey &k, uint32_t client_isn, uint64_t now_ns) const noexcept {
+
+                    // 5 bits range from 0 to 31 so every 64 seconds this numbers increades by 1 first 64 seconds 0, next 64 seconds 1, next 64 second 2 , like that 
+                    // SO TOTAL 32 * 64 = 34 MINUTES 
                     const uint32_t slot = static_cast<uint32_t>(now_ns / kCookieSlotNs) & 0x1F;
                     return (slot << 27) | cookie_mac(k, client_isn, slot);
                 }
@@ -705,6 +888,8 @@ namespace aethon {
                 }
 
                 size_t session_count() const noexcept { return sessions_.size(); }
+                WorkerMemoryBudget &memory_budget() noexcept { return budget_; }
+                const WorkerMemoryBudget &memory_budget() const noexcept { return budget_; }
 
                 ~TcpAssemblerEngine(){
 
@@ -735,6 +920,8 @@ namespace aethon {
                 }
 
             void purged_expired(uint64_t now_ns) noexcept {
+                const bool critical_memory = budget_.is_critical();
+
                 for (size_t i = 0; i < sessions_.capacity(); ++i) {
                     AETHON_BUILTIN_PREFETCH(&sessions_.cells()[i], 0, 1);
                     auto *cell = &sessions_.cells()[i];
@@ -751,17 +938,26 @@ namespace aethon {
                             // abandoned connections are reclaimed quickly instead of holding memory
                             // for the full established idle timeout. Everything else: 120 s (longer
                             // than typical backend keep-alive).
+
+
+
+                            // under critical memory pressure aggresively evict idle connections(5s threashold)
                             uint64_t limit;
                             if (session->state == TcpState::SYN_SENT) {
                                 limit = AETHON_TCP_SYN_TIMEOUT_NS;
-                            } else if (!has_outbound && (session->state == TcpState::CLOSING || session->fin_sent)) {
+                            } else if (AETHON_UNLIKELY(critical_memory)) {
+                                limit = config::memory::CRITICAL_EVICTION_AGE_NS;
+                            } 
+                            else if (!has_outbound && (session->state == TcpState::CLOSING || session->fin_sent)) {
                                 limit = AETHON_TCP_TIMEWAIT_TIMEOUT_NS;
                             } else {
                                 limit = AETHON_TCP_ESTAB_TIMEOUT_NS;
                             }
                             bool is_expired = age > limit;
                             if (AETHON_UNLIKELY(is_expired)) {
-                                if (session->state != TcpState::SYN_SENT) {
+                                if (critical_memory && age > config::memory::CRITICAL_EVICTION_AGE_NS && session->state == TcpState::ESTABLISHED) {
+                                    stats::count(stats::Event::SessionEvictedMemoryPressure);
+                                } else if (session->state != TcpState::SYN_SENT) {
                                     stats::count(stats::Event::SessionExpiredIdle);
                                 }
                                 TcpKey stale_key = cell->key;
@@ -770,6 +966,17 @@ namespace aethon {
                             }
                         }
                     }
+                }
+            }
+
+            // Run the idle-session reaper at most once per second. The per-packet path already
+            // does this, but when traffic stops no packets arrive, so stale TIME_WAIT / idle
+            // sessions would never be reaped and the worker would busy-poll forever. The worker
+            // calls this from its idle loop so sessions still drain with no traffic.
+            AETHON_ALWAYS_INLINE void reap_if_due(uint64_t now_ns) noexcept {
+                if (now_ns - last_cleanup_ns_ > 1000000000ULL) {
+                    purged_expired(now_ns);
+                    last_cleanup_ns_ = now_ns;
                 }
             }
 
@@ -786,6 +993,50 @@ namespace aethon {
                 }
             }
 
+            bool handle_icmp_pmtu(uint32_t client_ip, uint16_t client_port,
+                                  uint32_t server_ip, uint16_t server_port,
+                                  uint16_t next_hop_mtu) noexcept {
+                TcpKey key;
+                key.src_ip   = client_ip;
+                key.dst_ip   = server_ip;
+                key.src_port = client_port;
+                key.dst_port = server_port;
+
+                TcpStreamSession **slot = sessions_.find(key);
+                if (AETHON_UNLIKELY(slot == nullptr || *slot == nullptr)) {
+                    return false;
+                }
+
+                TcpStreamSession *session = *slot;
+
+                // RFC 1191 Path MTU Discovery:
+                // Next-Hop MTU is provided in the ICMP header. Standard IPv4 header (20B)
+                // + TCP header (20B) gives 40 bytes minimum L3/L4 overhead.
+                uint16_t new_mss = config::tcp::MIN_IPV4_MSS;
+                if (next_hop_mtu > 40) {
+                    new_mss = next_hop_mtu - 40;
+                } else if (session->params.mss > config::tcp::MIN_IPV4_MSS) {
+                    // Plateau descent (RFC 1191 Table 7-1)
+                    if (session->params.mss > 1420) new_mss = 1420;
+                    else if (session->params.mss > 1240) new_mss = 1240;
+                    else new_mss = config::tcp::MIN_IPV4_MSS;
+                }
+
+                // Minimum IPv4 MSS guaranteed by RFC 791 / RFC 879 is 536 bytes
+                new_mss = std::clamp(new_mss, static_cast<uint16_t>(config::tcp::MIN_IPV4_MSS), session->params.mss);
+
+                if (new_mss < session->params.mss) {
+                    session->params.mss = new_mss;
+                    session->cc.mss = new_mss;
+                    // Reset congestion window to force fast adaptation and avoid oversized frames
+                    session->cc.ssthresh = std::max<uint32_t>(2 * new_mss, session->cc.cwnd / 2);
+                    session->cc.cwnd = 1 * new_mss;
+                    stats::count(stats::Event::IcmpPmtuUpdate);
+                    return true;
+                }
+                return false;
+            }
+
             // process packet
 
             AETHON_ALWAYS_INLINE TcpAssemblyResult process_packet(
@@ -800,6 +1051,13 @@ namespace aethon {
                 AETHON_BUILTIN_PREFETCH(tcph, 0, 3);
                 if (payload_len > 0) {
                     AETHON_BUILTIN_PREFETCH(payload, 0, 3);
+                }
+
+
+
+                bool do_cleanup = (now_ns - last_cleanup_ns_ > 1000000000ULL);
+                if(AETHON_UNLIKELY(!do_cleanup && budget_.is_critical() && last_cleanup_ns_ > 50000000ULL)){
+                    do_cleanup = true; //  // Trigger every 50ms instead of 1000ms!
                 }
 
 
@@ -832,64 +1090,95 @@ namespace aethon {
                     session = *slot;
                     AETHON_BUILTIN_PREFETCH(session, 1, 3);
                     result.session = session;
-                }else if(AETHON_UNLIKELY(!(flags & TH_SYN))){
-                    // No session: only a handshake ACK (or first data) carrying a valid SYN cookie may create one
-                    if ((flags & TH_ACK) && !(flags & (TH_RST | TH_FIN)) &&
-                        sessions_.size() < AETHON_MAX_ACTIVE_TCP_SESSION) {
-                        const uint32_t ack = ntohl(tcph->ack_seq);
-                        if (check_syn_cookie(key, seq - 1, ack - 1, now_ns)) {
-                            session = new (std::nothrow) TcpStreamSession();
-                            if (AETHON_UNLIKELY(!session)) {
-                                return result;
-                            }
-                            session->key = key;
-                            session->isn = seq - 1;
-                            session->rcv_nxt = seq;
-                            session->server_isn = ack - 1;
-                            session->send_nxt = ack;
-                            session->snd_una = ack;
-                            session->state = TcpState::ESTABLISHED;
-                            session->last_seen_ns = now_ns;
-                            sessions_.insert(key, session);
-                            result.session = session;
-                            result.from_cookie = true;
-                            stats::count(stats::Event::SynCookieAccepted);
-                            // fall through: this segment's ACK and payload are processed normally below
+
+                    // If a brand-new SYN arrives for a session that is closing, half-closed, or whose backend is gone:
+                    // Client is reincarnating the socket / port reuse (RFC 1122 Section 4.2.2.13).
+                    if (AETHON_UNLIKELY((flags & TH_SYN) && session->state != TcpState::SYN_SENT)) {
+                        if (session->state == TcpState::CLOSING || session->fin_sent || session->client_fin_received || session->backend_fd < 0) {
+                            delete session;
+                            sessions_.erase(key);
+                            session = nullptr;
+                            result.session = nullptr;
                         }
                     }
-                    if (!session) {
+                }
+                
+                if (session == nullptr) {
+                    if (AETHON_UNLIKELY(!(flags & TH_SYN))) {
+                        // No session: only a handshake ACK (or first data) carrying a valid SYN cookie may create one
+                        if ((flags & TH_ACK) && !(flags & (TH_RST | TH_FIN)) &&
+                            sessions_.size() < AETHON_MAX_ACTIVE_TCP_SESSION) {
+                            const uint32_t ack = ntohl(tcph->ack_seq);
+                            if (check_syn_cookie(key, seq - 1, ack - 1, now_ns)) {
+
+                                if(AETHON_UNLIKELY(budget_.is_over_budget())){
+                                    stats::count(stats::Event::SynDroppedMemoryPressure);
+                                    return result;
+                                }
+
+                                session = new (std::nothrow) TcpStreamSession();
+                                session->budget = &budget_;
+                                if (AETHON_UNLIKELY(!session)) {
+                                    return result;
+                                }
+                                session->key = key;
+                                session->isn = seq - 1;
+                                session->rcv_nxt = seq;
+                                session->server_isn = ack - 1;
+                                session->send_nxt = ack;
+                                session->snd_una = ack;
+                                session->state = TcpState::ESTABLISHED;
+                                session->last_seen_ns = now_ns;
+                                sessions_.insert(key, session);
+                                result.session = session;
+                                result.from_cookie = true;
+                                stats::count(stats::Event::SynCookieAccepted);
+                                // fall through: this segment's ACK and payload are processed normally below
+                            }
+                        }
+                        if (!session) {
+                            return result;
+                        }
+                    } else {
+                        // Table under pressure (e.g. SYN flood): answer statelessly, allocate nothing
+                        if(AETHON_UNLIKELY(sessions_.size() >= AETHON_SYNCOOKIE_THRESHOLD)){
+                            result.syn_cookie = true;
+                            result.syn_cookie_isn = make_syn_cookie(key, seq, now_ns);
+                            stats::count(stats::Event::SynCookieSent);
+                            return result;
+                        }
+
+
+                        // if worker memory budget exhaused refuse new syn to prevent OOM
+
+                        if(AETHON_UNLIKELY(budget_.is_over_budget())){
+                            stats::count(stats::Event::SynDroppedMemoryPressure);
+                            return result;
+                        }
+
+                        // light weight session allocation only 64 bytes
+
+                        session = new (std::nothrow) TcpStreamSession();
+                        session->budget = &budget_;
+                        if(AETHON_UNLIKELY(!session)){
+                            return result;
+                        }
+
+                        session->key = key;
+                        session->isn = seq;
+                        session->rcv_nxt = seq + 1;
+
+                        session->state = TcpState::SYN_SENT;
+
+                        session->last_seen_ns = now_ns;
+
+                        parse_tcp_syn_option(tcph, session->params);
+
+                        sessions_.insert(key, session);
+                        result.session = session;
+                        result.is_syn = true;
                         return result;
                     }
-                }else{
-                    // Table under pressure (e.g. SYN flood): answer statelessly, allocate nothing
-                    if(AETHON_UNLIKELY(sessions_.size() >= AETHON_SYNCOOKIE_THRESHOLD)){
-                        result.syn_cookie = true;
-                        result.syn_cookie_isn = make_syn_cookie(key, seq, now_ns);
-                        stats::count(stats::Event::SynCookieSent);
-                        return result;
-                    }
-
-                    // light weight session allocation only 64 bytes
-
-                    session = new (std::nothrow) TcpStreamSession();
-                    if(AETHON_UNLIKELY(!session)){
-                        return result;
-                    }
-
-                    session->key = key;
-                    session->isn = seq;
-                    session->rcv_nxt = seq + 1;
-
-                    session->state = TcpState::SYN_SENT;
-
-                    session->last_seen_ns = now_ns;
-
-                    parse_tcp_syn_option(tcph, session->params);
-
-                     sessions_.insert(key, session);
-                    result.session = session;
-                    result.is_syn = true;
-                    return result;
                 }
 
                 session->last_seen_ns = now_ns;
@@ -941,16 +1230,18 @@ namespace aethon {
                 // Process client ACKs on established connections to slide outbound send window
                 if (AETHON_LIKELY(flags & TH_ACK)) {
 
-                    session->snd_wnd = static_cast<uint32_t>(ntohs(tcph->window)) << session->params.wscale;
+
+                    // if window size is enabled
+                    const uint8_t wshift = session->params.wscale_enabled ? session->params.client_wscale : 0;
+                     session->snd_wnd = static_cast<uint32_t>(ntohs(tcph->window)) << wshift;
+                    parse_tcp_ack_options(tcph, session);
 
                     uint32_t ack_seq = ntohl(tcph->ack_seq);
+                    // snd_una the oldest sequence no we transmitted that has not yet been Acked
                     if (TcpSeq::gt(ack_seq, session->snd_una) && TcpSeq::lte(ack_seq, session->send_nxt)) {
                         size_t bytes_acked = ack_seq - session->snd_una;
-                        if (bytes_acked <= session->snd_buf.size()) {
-                            session->snd_buf.erase(session->snd_buf.begin(), session->snd_buf.begin() + bytes_acked);
-                        } else {
-                            session->snd_buf.clear();
-                        }
+                        // O(1) ACK consumption: advances head pointer without O(n^2) memmove front erasure
+                        session->snd_buf.consume(bytes_acked);
 
                         // RFC 6298 (Karn's Algorithm): Update RTT if this ACK covers the sampled sequence
                         if (session->rtt_time_ns > 0 && session->retransmit_count == 0 && TcpSeq::gte(ack_seq, session->rtt_seq)) {
@@ -963,8 +1254,8 @@ namespace aethon {
                         session->cc.on_ack(bytes_acked);
                         // Reset RTO timer and retry counter (RFC 6298 dynamic RTO)
                         session->rto_ms = (session->srtt_ms > 0)
-                            ? std::min(std::max(session->srtt_ms + (session->rttvar_ms << 2), 200u), 60000u)
-                            : 200u;
+                            ? std::min(std::max(session->srtt_ms + (session->rttvar_ms << 2), 20u), 60000u)
+                            : 20u;
                         session->retransmit_count = 0;
                         session->dup_ack_count = 0;
                         session->last_tx_time_ns = now_ns;

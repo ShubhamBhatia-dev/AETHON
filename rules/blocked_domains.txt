@@ -1,2 +1,7 @@
-mydomain.com
-aethon.local
+# Aethon SNI / TLS Domain Blocklist
+# Traffic with TLS SNI matching these entries is immediately dropped/reset at wire speed.
+malicious.test.com
+evil-tracker.com
+c2-botnet.net
+malware-payload.org
+crypto-drainer.xyz

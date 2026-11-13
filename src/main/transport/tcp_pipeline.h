@@ -2,6 +2,7 @@
 
 #include "aethon/aethon.h"
 #include "af_xdp_header.h"
+#include "config/constants.h"
 #include <algorithm>
 #include <cstring>
 #include <liburing.h>
@@ -94,11 +95,11 @@ namespace pipeline {
         size_t tracked() const noexcept { return map_.size(); }
 
     private:
-        static constexpr uint8_t kSamples = 8;
-        static constexpr size_t kMaxFingerprints = 4000;   // < map capacity, bounds memory
+        static constexpr uint8_t kSamples = config::tls::JA3_RATE_LIMIT_SAMPLES;
+        static constexpr size_t kMaxFingerprints = config::tls::JA3_MAX_FINGERPRINTS;   // < map capacity, bounds memory
         struct Stat {
-            uint64_t window_start_ns{0};
-            uint32_t count{0};
+            uint64_t window_start_ns{0}; // the start of the 10 second window in nanoseconds
+            uint32_t count{0}; // the number of connection initiated by this specific JA3 in the current 10-second window
             uint32_t sample_ips[kSamples]{};   // a few distinct source IPs seen, for logging
             uint8_t sample_count{0};
         };
@@ -169,8 +170,9 @@ namespace pipeline {
         return (isn == 0) ? 1 : isn;
     }
 
+    inline std::atomic<uint32_t> g_engine_mode{2}; // 0 = Bypass, 1 = Match-only, 2 = Full Protection
     inline dns::DomainBlocklist g_domain_blocklist;
-    inline service::ServiceRegistry g_service_registry;
+    inline service::ServiceRegistryHolder g_service_registry;
 
     enum class SendResult : uint8_t {
         Queued,
@@ -207,30 +209,39 @@ namespace pipeline {
                 return SendResult::QueueFull;
             }
 
-            session->snd_buf.insert(session->snd_buf.end(), data, data + len);
+            session->snd_buf.append(data, len);
         }
 
-        constexpr size_t AETHON_MSS = 1460;
+        constexpr size_t AETHON_MSS = config::tcp::DEFAULT_MSS;
         size_t sent_offset = session->send_nxt - session->snd_una;
+        uint32_t packets_sent = 0;
+        uint64_t tx_now_ns = 0;
 
         while (sent_offset < session->snd_buf.size()) {
-            if(AETHON_UNLIKELY(tx_pool.empty())){
+            size_t in_flight = session->send_nxt - session->snd_una;
+            size_t available_bytes = session->snd_buf.size() - sent_offset;
+            // RFC 896 / RFC 1122: Only hold back sub-MSS data if there is already unacknowledged
+            // data in flight. If in_flight == 0 (e.g. initial HTTP headers or small responses), send immediately!
+            if (available_bytes < AETHON_MSS && in_flight > 0 && !session->fin_pending) {
+                break;
+            }
+
+            if (AETHON_UNLIKELY(tx_pool.empty())) {
                 break;
             }
 
             // Combined Flow Control (snd_wnd) and Congestion Control (cwnd)
-            size_t in_flight = session->send_nxt - session->snd_una;
             size_t allowed = session->cc.allowed_to_send(in_flight, session->snd_wnd);
             if (allowed == 0) {
                 break;
             }
 
-            size_t chunk_len = std::min({session->snd_buf.size() - sent_offset, AETHON_MSS, allowed});
+            size_t chunk_len = std::min({available_bytes, AETHON_MSS, allowed});
             uint64_t tx_buf_addr = tx_pool.back();
             tx_pool.pop_back();
             uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
             AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
-            // Send the chunk from snd_buf:
+            // Send the chunk from snd_buf (batching sendto):
             bool sent = net::PacketInjector::ipv4_send_tcp_data(
                 sock, tx_buf_addr, pkt,
                 session->client_mac, session->server_mac,
@@ -238,10 +249,14 @@ namespace pipeline {
                 session->key.src_port, session->key.dst_port,
                 session->send_nxt, session->rcv_nxt,
                 session->snd_buf.data() + sent_offset, chunk_len, // <-- data from snd_buf!
-                session->recv_window());
+                session->recv_window(),
+                false); // flush = false (batch)
             if (AETHON_LIKELY(sent)) {
-                uint64_t tx_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                packets_sent++;
+                if (AETHON_UNLIKELY(tx_now_ns == 0)) {
+                    tx_now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count();
+                }
                 // Karn's algorithm: sample RTT on outbound data when not retransmitting
                 if (session->rtt_time_ns == 0 && session->retransmit_count == 0) {
                     session->rtt_seq = session->send_nxt + chunk_len;
@@ -251,15 +266,49 @@ namespace pipeline {
                 sent_offset += chunk_len;
                 // Record timestamp for RTO timer:
                 session->last_tx_time_ns = tx_now_ns;
+
+                if (packets_sent % 32 == 0) {
+                    sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
+                }
             } else {
                 tx_pool.push_back(tx_buf_addr);
                 break;
             }
-        
+        }
+
+        if (packets_sent > 0) {
+            sendto(xsk_socket__fd(sock->xsk), nullptr, 0, MSG_DONTWAIT, nullptr, 0);
         }
 
         
         return SendResult::Queued;
+    }
+
+    inline constexpr const char* HTTP_502_BAD_GATEWAY = config::http::HTTP_502_BAD_GATEWAY;
+
+    inline bool send_server_502(
+        xdp::aethon_xsk_socket_info *sock,
+        IPv4TcpAssembler::TcpStreamSession *session,
+        std::vector<uint64_t> &tx_pool
+    ) noexcept {
+        if (!session || tx_pool.empty()) return false;
+        if (session->tls_conn.is_established()) {
+            session->tls_conn.encrypt(
+                reinterpret_cast<const uint8_t *>(HTTP_502_BAD_GATEWAY),
+                sizeof(HTTP_502_BAD_GATEWAY) - 1);
+            uint8_t enc_tx[4096];
+            int enc_len;
+            while ((enc_len = session->tls_conn.read_pending_tx(enc_tx, sizeof(enc_tx))) > 0) {
+                send_tcp_segmented_data(sock, session, enc_tx, static_cast<size_t>(enc_len), tx_pool);
+            }
+        } else {
+            send_tcp_segmented_data(
+                sock, session,
+                reinterpret_cast<const uint8_t *>(HTTP_502_BAD_GATEWAY),
+                sizeof(HTTP_502_BAD_GATEWAY) - 1,
+                tx_pool);
+        }
+        return true;
     }
 
     AETHON_ALWAYS_INLINE bool retransmit_unacked_data(
@@ -273,7 +322,7 @@ namespace pipeline {
             return false;
         }
 
-        constexpr size_t AETHON_MSS = 1460;
+        constexpr size_t AETHON_MSS = config::tcp::DEFAULT_MSS;
         size_t in_flight = session->send_nxt - session->snd_una;
         if (in_flight == 0) return false;
 
@@ -282,15 +331,24 @@ namespace pipeline {
         size_t retrans_offset = 0;
         uint32_t packets_sent = 0;
 
+
+
         while (retrans_offset < to_retransmit && !tx_pool.empty()) {
             size_t chunk_len = std::min(to_retransmit - retrans_offset, AETHON_MSS);
+            uint32_t seq = session->snd_una + static_cast<uint32_t>(retrans_offset);
+
+            // SACK check: If the client already holds this chunk, skip retransmitting it!
+            if (session->params.sack_permitted && session->is_sacked(seq)) {
+                retrans_offset += chunk_len;
+                continue;
+            }
+
             uint64_t tx_buf_addr = tx_pool.back();
             tx_pool.pop_back();
 
             uint8_t *pkt = reinterpret_cast<uint8_t *>(xsk_umem__get_data(sock->umen->buffer, tx_buf_addr));
             AETHON_BUILTIN_PREFETCH(pkt, 1, 3);
 
-            uint32_t seq = session->snd_una + static_cast<uint32_t>(retrans_offset);
             bool sent = net::PacketInjector::ipv4_send_tcp_data(
                 sock, tx_buf_addr, pkt,
                 session->client_mac, session->server_mac,
@@ -354,6 +412,47 @@ namespace pipeline {
         return false;
     }
 
+    /**
+     * @brief Scans a reassembled or decrypted TCP payload against both the static base
+     *        Hyperscan worker and the hot-reloadable custom-rule Hyperscan worker.
+     */
+    template <typename Scanner>
+    AETHON_ALWAYS_INLINE bool scan_payload_with_dpi(
+        IPv4TcpAssembler::TcpStreamSession * __restrict__ session,
+        Scanner & __restrict__ scanner,
+        Scanner & __restrict__ custom_scanner,
+        uint64_t custom_gen_id,
+        const uint8_t * __restrict__ data,
+        size_t len
+    ) noexcept {
+        bool blocked = false;
+        if (AETHON_LIKELY(scanner.is_ready())) {
+            if (AETHON_UNLIKELY(session && !session->hs_stream)) {
+                session->hs_stream = scanner.open_stream();
+            }
+            blocked = (session && session->hs_stream)
+                ? scanner.scan_stream(session->hs_stream, data, len)
+                : scanner.scan(data, len);
+        }
+        if (!blocked && AETHON_UNLIKELY(custom_scanner.is_ready())) {
+            if (session) {
+                // Reopen stream cleanly when SIGHUP swaps the custom Hyperscan generation
+                if (AETHON_UNLIKELY(session->custom_hs_stream && session->custom_hs_gen != custom_gen_id)) {
+                    hs_close_stream(session->custom_hs_stream, nullptr, nullptr, nullptr);
+                    session->custom_hs_stream = nullptr;
+                }
+                if (AETHON_UNLIKELY(!session->custom_hs_stream)) {
+                    session->custom_hs_stream = custom_scanner.open_stream();
+                    session->custom_hs_gen = custom_gen_id;
+                }
+            }
+            blocked = (session && session->custom_hs_stream)
+                ? custom_scanner.scan_stream(session->custom_hs_stream, data, len)
+                : custom_scanner.scan(data, len);
+        }
+        return blocked;
+    }
+
     template <typename Scanner>
     AETHON_ALWAYS_INLINE bool handle_tcp_packet(
         xdp::aethon_xsk_socket_info * __restrict__ sock,
@@ -367,7 +466,9 @@ namespace pipeline {
         Scanner & __restrict__ scanner,
         std::vector<uint64_t>&tx_pool ,
     int epfd,
-        Ja3RateLimiter & __restrict__ ja3) noexcept
+        Ja3RateLimiter & __restrict__ ja3,
+        Scanner & __restrict__ custom_scanner,
+        uint64_t custom_gen_id) noexcept
     {
         const size_t ip_hdr_len = iph->ihl * 4;
 
@@ -460,8 +561,9 @@ namespace pipeline {
             // RFC 6298: Record timestamp of SYN-ACK transmission for initial handshake RTT measurement
             res.session->synack_tx_time_ns = now_ns;
 
-            return net::PacketInjector::ipv4_send_tcp_syn_ack(
-                sock, buf_addr, pkt, eth, iph, tcph, res.session->server_isn, ntohl(tcph->seq));
+                        return net::PacketInjector::ipv4_send_tcp_syn_ack(
+                sock, buf_addr, pkt, eth, iph, tcph, res.session->server_isn, ntohl(tcph->seq),
+                res.session->params.wscale_enabled, res.session->params.server_wscale);
         }
         
 
@@ -470,8 +572,23 @@ namespace pipeline {
             if (res.is_fin && res.session->backend_fd >= 0) {
                 ::shutdown(res.session->backend_fd, SHUT_WR);
             }
-            return net::PacketInjector::ipv4_send_tcp_ack(
+            // If client sent FIN, and our backend is already closed and fully ACKed, send our FIN-ACK right now!
+            if (res.is_fin && res.session->fin_pending && !res.session->fin_sent &&
+                res.session->snd_buf.empty() && res.session->snd_una == res.session->send_nxt) {
+                return send_server_fin(sock, buf_addr, pkt, res.session);
+            }
+            bool both_fins = res.is_fin && res.session->fin_sent;
+            bool sent = net::PacketInjector::ipv4_send_tcp_ack(
                 sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
+            if (both_fins) {
+                if (res.session->backend_fd >= 0) {
+                    epoll_ctl(epfd, EPOLL_CTL_DEL, res.session->backend_fd, nullptr);
+                    ::close(res.session->backend_fd);
+                    res.session->backend_fd = -1;
+                }
+                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+            }
+            return sent;
         }
 
         // Outbound Pump: If client ACKed data on established or closing session, pump any remaining unsent snd_buf
@@ -485,7 +602,7 @@ namespace pipeline {
             if (res.session->backend_epollin_disabled && res.session->backend_fd >= 0) {
                 size_t free_space = (res.session->snd_buf.size() < res.session->MAX_SND_BUF)
                                     ? (res.session->MAX_SND_BUF - res.session->snd_buf.size()) : 0;
-                if (free_space >= 65536) {
+                if (free_space >= 65536 || (!res.session->budget || !res.session->budget->is_over_budget())) {
                     res.session->backend_epollin_disabled = false;
                     update_backend_epoll(epfd, res.session);
                 }
@@ -516,7 +633,7 @@ namespace pipeline {
             size_t hello_len = res.payload_len;
 
             // RFC 8446 limits the maximum TLS record payload to 2^14 (16384) bytes + 5-byte header.
-            static constexpr size_t MAX_CLIENT_HELLO = 16384 + 5;
+            static constexpr size_t MAX_CLIENT_HELLO = config::tcp::MAX_CLIENT_HELLO;
 
             // Handle multi-segment ClientHello (e.g., Chrome with post-quantum keys > 1460 bytes MTU)
             if(res.session && res.session->tls_conn.status() == tls::TlsSessionStatus::IDLE){
@@ -566,30 +683,43 @@ namespace pipeline {
             // Parse complete ClientHello to extract SNI and enforce domain policy
             auto tls_info = tls::parse_client_hello(hello_data, hello_len);
             if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(tls_info.is_client_hello, 1, 0.02)) {
+                uint32_t emode = g_engine_mode.load(std::memory_order_relaxed);
+
                 // JA3 flood control: too many ClientHellos with the same fingerprint on this worker
                 if (AETHON_UNLIKELY(res.session && ja3.should_block(tls_info.ja3_str, iph->saddr, now_ns))) {
                     stats::count(stats::Event::Ja3RateLimited);
-                    res.session->client_hello_buf.clear();
-                    tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
-                    return net::PacketInjector::ipv4_send_tcp_rst(
-                        sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                    if (emode == 1) {
+                        std::cout << "\n[JA3 AUDIT] Rate Limit Exceeded for fingerprint " << tls_info.ja3_str.c_str()
+                                  << " (Match-only mode: NOT dropped)\n";
+                    } else {
+                        res.session->client_hello_buf.clear();
+                        tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        return net::PacketInjector::ipv4_send_tcp_rst(
+                            sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                    }
                 }
                 if (AETHON_UNLIKELY(tls_info.sni.empty() || !g_domain_blocklist.is_allowed(tls_info.sni))) {
-                    std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
-                    std::cout << "  Attacker : ";
-                    print_ip(iph->saddr);
-                    std::cout << ":" << ntohs(tcph->source) << std::endl;
-                    std::cout << "  Target   : ";
-                    print_ip(iph->daddr);
-                    std::cout << ":" << ntohs(tcph->dest) << std::endl;
+                    if (emode == 1) {
+                        std::cout << "\n[IPS AUDIT] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni)
+                                  << " (Match-only mode: NOT dropped)\n";
+                        stats::count(stats::Event::RstSniBlocked);
+                    } else {
+                        std::cout << "\n[IPS BLOCK] Unauthorized TLS Domain! SNI: " << (tls_info.sni.empty() ? "NONE" : tls_info.sni) << std::endl;
+                        std::cout << "  Attacker : ";
+                        print_ip(iph->saddr);
+                        std::cout << ":" << ntohs(tcph->source) << std::endl;
+                        std::cout << "  Target   : ";
+                        print_ip(iph->daddr);
+                        std::cout << ":" << ntohs(tcph->dest) << std::endl;
 
-                    if (res.session) {
-                        res.session->client_hello_buf.clear();
+                        if (res.session) {
+                            res.session->client_hello_buf.clear();
+                        }
+                        tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                        stats::count(stats::Event::RstSniBlocked);
+                        return net::PacketInjector::ipv4_send_tcp_rst(
+                            sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                     }
-                    tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
-                    stats::count(stats::Event::RstSniBlocked);
-                    return net::PacketInjector::ipv4_send_tcp_rst(
-                        sock, buf_addr, pkt, eth, iph, tcph, payload_len);
                 }
 
                 if (res.session) {
@@ -600,6 +730,7 @@ namespace pipeline {
                     if (svc && svc->ssl_ctx) {
                         res.session->tls_conn.init(svc->ssl_ctx);
                         res.session->backend_port = svc->backend_port;
+                        res.session->is_http = svc->is_http;
                     }
                 }
 
@@ -638,12 +769,8 @@ namespace pipeline {
                     int plain_len;
                     while ((plain_len = res.session->tls_conn.decrypt(plain_buf, sizeof(plain_buf))) > 0) {
                         any_decrypted = true;
-                        if (AETHON_UNLIKELY(res.session && !res.session->hs_stream)) {
-                            res.session->hs_stream = scanner.open_stream();
-                        }
-                        bool attack_detected = (res.session && res.session->hs_stream)
-                            ? scanner.scan_stream(res.session->hs_stream, plain_buf, plain_len)
-                            : scanner.scan(plain_buf, plain_len);
+                        bool attack_detected = scan_payload_with_dpi(
+                            res.session, scanner, custom_scanner, custom_gen_id, plain_buf, static_cast<size_t>(plain_len));
                         if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(attack_detected, 1, 0.0001)) {
                             std::cout << "\n[IPS BLOCK] Malicious Decrypted TLS Payload Dropped!" << std::endl;
                             std::cout << "  Attacker : ";
@@ -661,12 +788,21 @@ namespace pipeline {
                             uint16_t target_port = res.session->backend_port;
                             if(target_port == 0){
                                 const auto *svc = g_service_registry.find_by_ip_port(iph->daddr, ntohs(tcph->dest));
-                                if(svc) target_port = svc->backend_port;
+                                if(svc) {
+                                    target_port = svc->backend_port;
+                                    res.session->is_http = svc->is_http;
+                                }
                             }
                             if(target_port > 0){
                                 int prev_fd = res.session->backend_fd;
                                 //  Protect against unbounded memory growth in backend_tx_buf (CWE-400 / CWE-770)
                                 if (AETHON_UNLIKELY(!res.session->forward_to_backend(plain_buf, plain_len, target_port))) {
+                                    if (res.session->is_http && !tx_pool.empty()) {
+                                        send_server_502(sock, res.session, tx_pool);
+                                        res.session->fin_pending = true;
+                                        stats::count(stats::Event::RstBackendFailed);
+                                        return false;
+                                    }
                                     tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
                                     stats::count(stats::Event::RstBackendFailed);
                                     return net::PacketInjector::ipv4_send_tcp_rst(
@@ -683,7 +819,7 @@ namespace pipeline {
                                         ev.events = ev_mask;
                                         ev.data.ptr = res.session;
                                         epoll_ctl(epfd, EPOLL_CTL_ADD, res.session->backend_fd, &ev);
-                                        res.session->epollout_armed = !res.session->backend_tx_buf.empty();
+                                        res.session->epollout_armed = !res.session->backend_tx_buf.empty(); // true when EPOLL_OUT was
                                         res.session->backend_epollin_disabled = false;
                                     } else if (!res.session->backend_tx_buf.empty() && !res.session->epollout_armed) {
                                         // Data is buffered and EPOLLOUT is not active: arm EPOLLOUT!
@@ -710,13 +846,9 @@ namespace pipeline {
                         sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
                 }
             } else {
-                if (AETHON_UNLIKELY(res.session && !res.session->hs_stream)) {
-                    res.session->hs_stream = scanner.open_stream();
-                }
                 // Forward and scan full assembled hello_data / hello_len (covers multi-segment ClientHello for plain/passthrough)
-                bool attack_detected = (res.session && res.session->hs_stream)
-                    ? scanner.scan_stream(res.session->hs_stream, hello_data, hello_len)
-                    : scanner.scan(hello_data, hello_len);
+                bool attack_detected = scan_payload_with_dpi(
+                    res.session, scanner, custom_scanner, custom_gen_id, hello_data, hello_len);
                 if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(attack_detected, 1, 0.0001)) {
                     std::cout << "\n[IPS BLOCK] Malicious TCP Packet Dropped!" << std::endl;
                     std::cout << "  Attacker : ";
@@ -737,7 +869,10 @@ namespace pipeline {
                     uint16_t target_port = res.session ? res.session->backend_port : 0;
                     if(target_port == 0){
                         const auto *svc =g_service_registry.find_by_ip_port(iph->daddr, ntohs(tcph->dest));
-                        if(svc) target_port = svc->backend_port;
+                        if(svc) {
+                            target_port = svc->backend_port;
+                            if (res.session) res.session->is_http = svc->is_http;
+                        }
                     }
 
                     if(target_port > 0 && res.session){
@@ -745,6 +880,12 @@ namespace pipeline {
                         // Bug A fix: Protect against unbounded memory growth in backend_tx_buf (CWE-400 / CWE-770)
                         if (AETHON_UNLIKELY(!res.session->forward_to_backend(hello_data, hello_len, target_port))) {
                             res.session->client_hello_buf.clear();
+                            if (res.session->is_http && !tx_pool.empty()) {
+                                send_server_502(sock, res.session, tx_pool);
+                                res.session->fin_pending = true;
+                                stats::count(stats::Event::RstBackendFailed);
+                                return false;
+                            }
                             tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
                             stats::count(stats::Event::RstBackendFailed);
                             return net::PacketInjector::ipv4_send_tcp_rst(
@@ -820,7 +961,7 @@ namespace pipeline {
         }
         last_rto_sweep_ns = now_ns;
 
-        constexpr uint8_t MAX_TCP_RETRIES = 8;
+        constexpr uint8_t MAX_TCP_RETRIES = config::tcp::MAX_TCP_RETRIES;
         uint32_t retransmitted = 0;
         tcp_engine.for_each_session([&](IPv4TcpAssembler::TcpStreamSession *session) {
             // Issue #3B: Inspect both ESTABLISHED and half-closed CLOSING sessions
@@ -891,8 +1032,9 @@ namespace pipeline {
     ) noexcept {
         if (AETHON_UNLIKELY(epfd < 0)) return 0;
 
-        static constexpr size_t BACKEND_BATCH_SIZE = 16;
+        static constexpr size_t BACKEND_BATCH_SIZE = config::tcp::BACKEND_BATCH_SIZE;
         struct epoll_event events[BACKEND_BATCH_SIZE];
+        // 0 means if no backends has data right now just return    
         int nfds = epoll_wait(epfd, events, BACKEND_BATCH_SIZE, 0);
         if (AETHON_LIKELY(nfds <= 0)) return 0;
 
@@ -938,13 +1080,13 @@ namespace pipeline {
 
             bool backend_closed = false;
             if (events[i].events & EPOLLIN) {
-                static constexpr size_t TLS_SLACK = 1024;
+                static constexpr size_t TLS_SLACK = config::tcp::TLS_SLACK;
                 // Keep reading until kernel buffer is empty or snd_buf has no space
                 while (true) {
                     size_t free_space = (session->snd_buf.size() < session->MAX_SND_BUF)
                                         ? (session->MAX_SND_BUF - session->snd_buf.size()) : 0;
                     size_t required_slack = session->tls_conn.is_established() ? TLS_SLACK : 0;
-                    if (free_space < required_slack + 1) {
+                    if (free_space < required_slack + 1 || (session->budget && session->budget->is_over_budget())) {
                         // Buffer is full: mask EPOLLIN to prevent level-triggered busy spinning
                         if (!session->backend_epollin_disabled && session->backend_fd >= 0) {
                             session->backend_epollin_disabled = true;
@@ -953,7 +1095,7 @@ namespace pipeline {
                         break;
                     }
 
-                    uint8_t resp_buf[16384];
+                    uint8_t resp_buf[65536];
                     size_t want = std::min(sizeof(resp_buf), free_space - required_slack);
                     ssize_t n = session->read_from_backend(resp_buf, want);
                     if (n > 0) {
@@ -1009,7 +1151,12 @@ namespace pipeline {
                     epoll_ctl(epfd, EPOLL_CTL_DEL, session->backend_fd, nullptr);
                     ::close(session->backend_fd);
                     session->backend_fd = -1;
+                }
 
+                // If this is an HTTP service, and the backend closed before delivering any response, serve 502
+                if (session->is_http && session->snd_buf.empty() && !session->fin_sent && !tx_pool.empty()) {
+                    send_server_502(sock, session, tx_pool);
+                    session->fin_pending = true;
                 }
 
                 // Issue #2: If send_buf is already completely empty and fully ACKed, send FIN

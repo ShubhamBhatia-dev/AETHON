@@ -10,6 +10,7 @@
 #include "tcp_assembler.h"
 #include "domain_blocklist.h"
 #include "ip_address.h"
+#include "stun_server.h"
 
 #include <cstdio>
 #include <vector>
@@ -191,6 +192,114 @@ static uint16_t reference_tcp_checksum(uint32_t saddr_be, uint32_t daddr_be, con
     return static_cast<uint16_t>(~sum);
 }
 
+
+static void test_tcp_window_scaling() {
+    std::printf("TCP Window Scaling (RFC 7323)\n");
+    TcpAssemblerEngine engine;
+    uint64_t now = 1'000'000'000ULL;
+
+    // 1. Client SYN with Window Scale Option (Kind 3, Len 3, Shift Count = 6)
+    struct SynWithWscale {
+        iphdr ip{};
+        tcphdr tcp{};
+        uint8_t opts[4]{}; // Kind 3, Len 3, Shift 6, NOP padding
+    } syn_pkt;
+
+    syn_pkt.ip.ihl = 5;
+    syn_pkt.ip.saddr = inet_addr("192.168.1.50");
+    syn_pkt.ip.daddr = inet_addr("192.168.1.1");
+    syn_pkt.tcp.source = htons(50000);
+    syn_pkt.tcp.dest = htons(443);
+    syn_pkt.tcp.seq = htonl(2000);
+    syn_pkt.tcp.doff = (sizeof(tcphdr) + 4) / 4;
+    reinterpret_cast<uint8_t *>(&syn_pkt.tcp)[13] = TH_SYN;
+
+    syn_pkt.opts[0] = 0x03; // TCPOPT_WINDOW
+    syn_pkt.opts[1] = 0x03; // Length 3
+    syn_pkt.opts[2] = 0x06; // Shift count 6 (x64)
+    syn_pkt.opts[3] = 0x01; // NOP padding
+
+    auto r_syn = engine.process_packet(&syn_pkt.ip, &syn_pkt.tcp, nullptr, 0, now);
+    CHECK(r_syn.session != nullptr, "session created with window scaling");
+    CHECK(r_syn.session->params.wscale_enabled, "wscale successfully negotiated");
+    CHECK(r_syn.session->params.client_wscale == 6, "client shift count is 6 (64x)");
+    CHECK(r_syn.session->params.server_wscale == 7, "server shift count is 7 (128x)");
+
+    // 2. Client sends ACK with 16-bit window field = 1000
+    struct AckPkt {
+        iphdr ip{};
+        tcphdr tcp{};
+    } ack_pkt;
+
+    ack_pkt.ip.ihl = 5;
+    ack_pkt.ip.saddr = syn_pkt.ip.saddr;
+    ack_pkt.ip.daddr = syn_pkt.ip.daddr;
+    ack_pkt.tcp.source = syn_pkt.tcp.source;
+    ack_pkt.tcp.dest = syn_pkt.tcp.dest;
+    ack_pkt.tcp.seq = htonl(2001);
+    ack_pkt.tcp.ack_seq = htonl(5000);
+    ack_pkt.tcp.doff = 5;
+    ack_pkt.tcp.window = htons(1000);
+    reinterpret_cast<uint8_t *>(&ack_pkt.tcp)[13] = TH_ACK;
+
+    engine.process_packet(&ack_pkt.ip, &ack_pkt.tcp, nullptr, 0, now += 1000);
+    CHECK(r_syn.session->state == TcpState::ESTABLISHED, "session established");
+    // 1000 shifted left by 6 = 64,000 bytes
+    CHECK(r_syn.session->snd_wnd == 64000, "advertised window scaled by 2^6 to 64,000 bytes");
+
+    // 3. RFC 7323 Section 2.3: Shift count > 14 clamped to 14
+    struct SynExcessiveShift {
+        iphdr ip{};
+        tcphdr tcp{};
+        uint8_t opts[4]{};
+    } syn_excess;
+
+    syn_excess.ip.ihl = 5;
+    syn_excess.ip.saddr = inet_addr("192.168.1.51");
+    syn_excess.ip.daddr = inet_addr("192.168.1.1");
+    syn_excess.tcp.source = htons(50001);
+    syn_excess.tcp.dest = htons(443);
+    syn_excess.tcp.seq = htonl(3000);
+    syn_excess.tcp.doff = (sizeof(tcphdr) + 4) / 4;
+    reinterpret_cast<uint8_t *>(&syn_excess.tcp)[13] = TH_SYN;
+
+    syn_excess.opts[0] = 0x03;
+    syn_excess.opts[1] = 0x03;
+    syn_excess.opts[2] = 18; // Illegal shift count > 14
+    syn_excess.opts[3] = 0x01;
+
+    auto r_excess = engine.process_packet(&syn_excess.ip, &syn_excess.tcp, nullptr, 0, now += 1000);
+    CHECK(r_excess.session != nullptr, "session created for excessive shift");
+    CHECK(r_excess.session->params.client_wscale == 14, "shift count 18 clamped to RFC maximum 14");
+
+    // 4. Client SYN WITHOUT window scale option: stays disabled (1x)
+    struct SynPlain {
+        iphdr ip{};
+        tcphdr tcp{};
+    } syn_plain;
+
+    syn_plain.ip.ihl = 5;
+    syn_plain.ip.saddr = inet_addr("192.168.1.52");
+    syn_plain.ip.daddr = inet_addr("192.168.1.1");
+    syn_plain.tcp.source = htons(50002);
+    syn_plain.tcp.dest = htons(443);
+    syn_plain.tcp.seq = htonl(4000);
+    syn_plain.tcp.doff = 5;
+    reinterpret_cast<uint8_t *>(&syn_plain.tcp)[13] = TH_SYN;
+
+    auto r_plain = engine.process_packet(&syn_plain.ip, &syn_plain.tcp, nullptr, 0, now += 1000);
+    CHECK(!r_plain.session->params.wscale_enabled, "wscale disabled when option absent");
+
+    ack_pkt.ip.saddr = syn_plain.ip.saddr;
+    ack_pkt.tcp.source = syn_plain.tcp.source;
+    ack_pkt.tcp.seq = htonl(4001);
+    ack_pkt.tcp.window = htons(1000);
+    engine.process_packet(&ack_pkt.ip, &ack_pkt.tcp, nullptr, 0, now += 1000);
+    // Unscaled: exactly 1000 bytes
+    CHECK(r_plain.session->snd_wnd == 1000, "unscaled window remains raw 1000 bytes");
+}
+
+
 static void test_tcp_checksum() {
     std::puts("TCP checksum verification");
     iphdr ip{};
@@ -287,6 +396,300 @@ static void test_domain_policy() {
     CHECK(!list.is_allowed(""), "empty SNI is rejected");
 }
 
+static void test_memory_budget() {
+    std::puts("Worker memory budget manager");
+    aethon::WorkerMemoryBudget budget(1000);
+    CHECK(budget.current_bytes() == 0, "initial budget starts at 0 bytes");
+    CHECK(!budget.is_over_budget(), "initial state is not over budget");
+    CHECK(!budget.is_critical(), "initial state is not critical");
+
+    budget.allocate(850);
+    CHECK(budget.is_critical(), "85% allocated triggers critical watermark");
+    CHECK(!budget.is_over_budget(), "85% allocated is not over budget");
+
+    budget.allocate(150);
+    CHECK(budget.is_over_budget(), "100% allocated is over budget");
+
+    budget.deallocate(100);
+    CHECK(!budget.is_over_budget(), "deallocating brings it back under budget");
+    CHECK(budget.is_critical(), "90% remaining is still in critical watermark");
+
+    budget.deallocate(600);
+    CHECK(!budget.is_critical(), "30% remaining is no longer critical");
+
+    budget.deallocate(10000);
+    CHECK(budget.current_bytes() == 0, "excess deallocate clamps to zero");
+
+    // Test engine integration with budget
+    TcpAssemblerEngine engine;
+    engine.memory_budget().set_max_bytes(4000);
+    uint64_t now = 10'000'000'000ULL;
+
+    auto make_pkt = [](uint32_t src, uint16_t sport, uint32_t seq, uint32_t ack, uint8_t flags) {
+        Packet p;
+        p.ip.ihl = 5;
+        p.ip.saddr = src;
+        p.ip.daddr = inet_addr("192.168.50.1");
+        p.tcp.source = htons(sport);
+        p.tcp.dest = htons(443);
+        p.tcp.seq = htonl(seq);
+        p.tcp.ack_seq = htonl(ack);
+        p.tcp.doff = 5;
+        reinterpret_cast<uint8_t *>(&p.tcp)[13] = flags;
+        return p;
+    };
+
+    const uint32_t client1 = inet_addr("192.168.50.10");
+    Packet syn1 = make_pkt(client1, 40001, 1000, 0, TH_SYN);
+    auto r1 = engine.process_packet(&syn1.ip, &syn1.tcp, nullptr, 0, now);
+    CHECK(r1.session != nullptr, "SYN accepted under normal memory budget");
+    CHECK(r1.session->recv_window() > 0, "normal receive window advertised");
+
+    // Simulate backend buffer consumption exceeding worker budget
+    engine.memory_budget().allocate(5000);
+    CHECK(engine.memory_budget().is_over_budget(), "budget is now exceeded");
+    CHECK(r1.session->recv_window() == 0, "zero window advertised when over budget");
+
+    // New incoming SYN from client 2 must be refused
+    uint64_t syn_dropped_before = aethon::stats::get(aethon::stats::Event::SynDroppedMemoryPressure);
+    const uint32_t client2 = inet_addr("192.168.50.20");
+    Packet syn2 = make_pkt(client2, 40002, 2000, 0, TH_SYN);
+    auto r2 = engine.process_packet(&syn2.ip, &syn2.tcp, nullptr, 0, now += 1000);
+    CHECK(r2.session == nullptr, "SYN refused when over budget");
+    CHECK(aethon::stats::get(aethon::stats::Event::SynDroppedMemoryPressure) > syn_dropped_before,
+          "SynDroppedMemoryPressure counter incremented");
+
+    // Relieve memory pressure below over_budget, but keep it critical (>85%)
+    engine.memory_budget().deallocate(1500); // 3500 / 4000 = 87.5%
+    CHECK(!engine.memory_budget().is_over_budget(), "budget no longer over limit");
+    CHECK(engine.memory_budget().is_critical(), "budget is in critical watermark (>85%)");
+    CHECK(r1.session->recv_window() > 0, "receive window re-opens when under budget");
+
+    // Now establish client 1 completely
+    Packet ack1 = make_pkt(client1, 40001, 1001, 5000, TH_ACK);
+    engine.process_packet(&ack1.ip, &ack1.tcp, nullptr, 0, now);
+
+    // Idle for 6 seconds under critical memory pressure -> aggressive eviction
+    uint64_t evicted_before = aethon::stats::get(aethon::stats::Event::SessionEvictedMemoryPressure);
+    now += 6ULL * 1000000000ULL; // advance 6 seconds
+    engine.purged_expired(now);
+    CHECK(aethon::stats::get(aethon::stats::Event::SessionEvictedMemoryPressure) > evicted_before,
+          "oldest idle session aggressively evicted under critical memory pressure");
+    CHECK(engine.session_count() == 0, "idle session purged from table");
+}
+
+static void test_stun_server() {
+    std::puts("STUN server protocol");
+    using namespace aethon::stun;
+
+    // 1. Validation test on malformed packets
+    uint8_t garbage[10]{};
+    CHECK(!StunServer::is_binding_request(garbage, sizeof(garbage)), "short packet rejected");
+
+    StunHeader req{};
+    req.msg_type = htons(0x0101); // response type, not request
+    req.msg_length = 0;
+    req.magic_cookie = htonl(StunServer::MAGIC_COOKIE);
+    std::memset(req.transaction_id, 0x42, 12);
+    CHECK(!StunServer::is_binding_request(reinterpret_cast<uint8_t *>(&req), sizeof(req)), "wrong message type rejected");
+
+    req.msg_type = htons(StunServer::BINDING_REQUEST);
+    req.magic_cookie = htonl(0xDEADBEEF); // wrong cookie
+    CHECK(!StunServer::is_binding_request(reinterpret_cast<uint8_t *>(&req), sizeof(req)), "wrong magic cookie rejected");
+
+    // 2. Valid request
+    req.magic_cookie = htonl(StunServer::MAGIC_COOKIE);
+    CHECK(StunServer::is_binding_request(reinterpret_cast<uint8_t *>(&req), sizeof(req)), "valid binding request accepted");
+
+    // 3. Response construction
+    uint8_t resp_buf[64]{};
+    uint32_t client_ip = inet_addr("203.0.113.195");
+    uint16_t client_port = htons(54321);
+
+    size_t resp_len = StunServer::build_response(
+        reinterpret_cast<uint8_t *>(&req), sizeof(req), client_ip, client_port, resp_buf, sizeof(resp_buf));
+    
+    CHECK(resp_len == StunServer::RESPONSE_SIZE, "response size is exactly 32 bytes");
+
+    const auto *resp_hdr = reinterpret_cast<const StunHeader *>(resp_buf);
+    CHECK(ntohs(resp_hdr->msg_type) == StunServer::BINDING_RESPONSE, "response message type is 0x0101");
+    CHECK(ntohs(resp_hdr->msg_length) == sizeof(StunXorMappedAddress), "attribute length matches");
+    CHECK(ntohl(resp_hdr->magic_cookie) == StunServer::MAGIC_COOKIE, "response echoes magic cookie");
+    CHECK(std::memcmp(resp_hdr->transaction_id, req.transaction_id, 12) == 0, "transaction ID echoed byte-for-byte");
+
+    const auto *attr = reinterpret_cast<const StunXorMappedAddress *>(resp_buf + sizeof(StunHeader));
+    CHECK(ntohs(attr->attr_type) == StunServer::ATTR_XOR_MAPPED_ADDRESS, "attribute type is XOR-MAPPED-ADDRESS (0x0020)");
+    CHECK(attr->family == 0x01, "address family is IPv4");
+
+    // Un-XOR the port and IP to verify correctness:
+    uint16_t unxored_port = attr->x_port ^ htons(static_cast<uint16_t>(StunServer::MAGIC_COOKIE >> 16));
+    uint32_t unxored_ip = attr->x_ip ^ htonl(StunServer::MAGIC_COOKIE);
+
+    CHECK(unxored_port == client_port, "XOR port decodes to original client port");
+    CHECK(unxored_ip == client_ip, "XOR IP decodes to original client IP");
+}
+
+static void test_tcp_sack() {
+    std::puts("TCP SACK (Selective Acknowledgment)");
+    TcpAssemblerEngine engine;
+    uint64_t now = 20'000'000'000ULL;
+
+    // 1. Client SYN with SACK-Permitted option (Kind 4, Length 2)
+    struct SynWithSack {
+        iphdr ip{};
+        tcphdr tcp{};
+        uint8_t opts[4]{0x04, 0x02, 0x01, 0x01}; // Kind 4, Len 2 + 2 NOPs
+    } syn_pkt;
+
+    syn_pkt.ip.ihl = 5;
+    syn_pkt.ip.saddr = inet_addr("192.168.50.30");
+    syn_pkt.ip.daddr = inet_addr("192.168.50.1");
+    syn_pkt.tcp.source = htons(55555);
+    syn_pkt.tcp.dest = htons(443);
+    syn_pkt.tcp.seq = htonl(1000);
+    syn_pkt.tcp.doff = (sizeof(tcphdr) + 4) / 4;
+    reinterpret_cast<uint8_t *>(&syn_pkt.tcp)[13] = TH_SYN;
+
+    auto r_syn = engine.process_packet(&syn_pkt.ip, &syn_pkt.tcp, nullptr, 0, now);
+    CHECK(r_syn.session != nullptr, "SYN with SACK-Permitted accepted");
+    CHECK(r_syn.session->params.sack_permitted, "SACK negotiated successfully in session params");
+
+    // 2. Client ACK to complete 3-way handshake
+    struct AckPkt {
+        iphdr ip{};
+        tcphdr tcp{};
+    } ack_pkt;
+
+    ack_pkt.ip.ihl = 5;
+    ack_pkt.ip.saddr = syn_pkt.ip.saddr;
+    ack_pkt.ip.daddr = syn_pkt.ip.daddr;
+    ack_pkt.tcp.source = syn_pkt.tcp.source;
+    ack_pkt.tcp.dest = syn_pkt.tcp.dest;
+    ack_pkt.tcp.seq = htonl(1001);
+    ack_pkt.tcp.ack_seq = htonl(5000);
+    ack_pkt.tcp.doff = 5;
+    reinterpret_cast<uint8_t *>(&ack_pkt.tcp)[13] = TH_ACK;
+
+    engine.process_packet(&ack_pkt.ip, &ack_pkt.tcp, nullptr, 0, now += 1000);
+    CHECK(r_syn.session->state == TcpState::ESTABLISHED, "session established");
+
+    // 3. Client sends duplicate ACK with SACK Option Kind 5 reporting received block [6000, 8000)
+    struct AckWithSack {
+        iphdr ip{};
+        tcphdr tcp{};
+        uint8_t opts[12]{}; // NOP, NOP, Kind 5, Len 10, left (4B), right (4B)
+    } sack_pkt;
+
+    sack_pkt.ip.ihl = 5;
+    sack_pkt.ip.saddr = syn_pkt.ip.saddr;
+    sack_pkt.ip.daddr = syn_pkt.ip.daddr;
+    sack_pkt.tcp.source = syn_pkt.tcp.source;
+    sack_pkt.tcp.dest = syn_pkt.tcp.dest;
+    sack_pkt.tcp.seq = htonl(1001);
+    sack_pkt.tcp.ack_seq = htonl(5000); // still asking for 5000
+    sack_pkt.tcp.doff = (sizeof(tcphdr) + 12) / 4;
+    reinterpret_cast<uint8_t *>(&sack_pkt.tcp)[13] = TH_ACK;
+
+    sack_pkt.opts[0] = 0x01; // NOP
+    sack_pkt.opts[1] = 0x01; // NOP
+    sack_pkt.opts[2] = 0x05; // Kind 5: SACK
+    sack_pkt.opts[3] = 0x0A; // Length 10 (2 + 8)
+    uint32_t left = htonl(6000);
+    uint32_t right = htonl(8000);
+    std::memcpy(&sack_pkt.opts[4], &left, 4);
+    std::memcpy(&sack_pkt.opts[8], &right, 4);
+
+    engine.process_packet(&sack_pkt.ip, &sack_pkt.tcp, nullptr, 0, now += 1000);
+
+    CHECK(r_syn.session->num_sack_blocks == 1, "parsed exactly 1 SACK block");
+    CHECK(r_syn.session->client_sack_blocks[0].left_edge == 6000, "SACK block left edge is 6000");
+    CHECK(r_syn.session->client_sack_blocks[0].right_edge == 8000, "SACK block right edge is 8000");
+
+    // 4. Test is_sacked() membership
+    CHECK(!r_syn.session->is_sacked(5000), "seq 5000 is missing (not sacked)");
+    CHECK(!r_syn.session->is_sacked(5999), "seq 5999 is missing (not sacked)");
+    CHECK(r_syn.session->is_sacked(6000), "seq 6000 is marked sacked");
+    CHECK(r_syn.session->is_sacked(7000), "seq 7000 is marked sacked");
+    CHECK(r_syn.session->is_sacked(7999), "seq 7999 is marked sacked");
+    CHECK(!r_syn.session->is_sacked(8000), "seq 8000 is beyond right edge (not sacked)");
+}
+
+static void test_icmp_pmtu_discovery() {
+    std::printf("ICMP Path-MTU Discovery (RFC 1191)\n");
+    TcpAssemblerEngine engine;
+    uint64_t now = 1'000'000'000ULL;
+
+    struct SynPkt {
+        iphdr ip{};
+        tcphdr tcp{};
+    } syn_pkt;
+
+    syn_pkt.ip.ihl = 5;
+    syn_pkt.ip.saddr = inet_addr("10.0.0.99");
+    syn_pkt.ip.daddr = inet_addr("10.0.0.1");
+    syn_pkt.tcp.source = htons(49152);
+    syn_pkt.tcp.dest = htons(443);
+    syn_pkt.tcp.seq = htonl(1000);
+    syn_pkt.tcp.doff = 5;
+    reinterpret_cast<uint8_t *>(&syn_pkt.tcp)[13] = TH_SYN;
+
+    auto r_syn = engine.process_packet(&syn_pkt.ip, &syn_pkt.tcp, nullptr, 0, now);
+    CHECK(r_syn.session != nullptr, "session created for PMTU test");
+    CHECK(r_syn.session->params.mss == 1460, "initial MSS is standard 1460");
+
+    // Establish the session
+    struct AckPkt {
+        iphdr ip{};
+        tcphdr tcp{};
+    } ack_pkt;
+
+    ack_pkt.ip.ihl = 5;
+    ack_pkt.ip.saddr = syn_pkt.ip.saddr;
+    ack_pkt.ip.daddr = syn_pkt.ip.daddr;
+    ack_pkt.tcp.source = syn_pkt.tcp.source;
+    ack_pkt.tcp.dest = syn_pkt.tcp.dest;
+    ack_pkt.tcp.seq = htonl(1001);
+    ack_pkt.tcp.ack_seq = htonl(5000);
+    ack_pkt.tcp.doff = 5;
+    reinterpret_cast<uint8_t *>(&ack_pkt.tcp)[13] = TH_ACK;
+
+    engine.process_packet(&ack_pkt.ip, &ack_pkt.tcp, nullptr, 0, now += 1000);
+    CHECK(r_syn.session->state == TcpState::ESTABLISHED, "session established for PMTU test");
+
+    // 1. Simulate router returning ICMP Type 3 Code 4 with Next-Hop MTU = 1420 (PPPoE / GRE tunnel)
+    bool pmtu_handled = engine.handle_icmp_pmtu(
+        syn_pkt.ip.saddr, syn_pkt.tcp.source,
+        syn_pkt.ip.daddr, syn_pkt.tcp.dest,
+        1420);
+    CHECK(pmtu_handled, "PMTU update successfully processed for active session");
+    CHECK(r_syn.session->params.mss == 1380, "MSS reduced from 1460 to 1380 (1420 - 40B)");
+    CHECK(r_syn.session->cc.mss == 1380, "congestion control MSS updated to 1380");
+    CHECK(r_syn.session->cc.cwnd == 1380, "cwnd reset to 1 MSS for fast congestion recovery");
+
+    // 2. Next intermediate tunnel bottleneck with MTU = 1280
+    pmtu_handled = engine.handle_icmp_pmtu(
+        syn_pkt.ip.saddr, syn_pkt.tcp.source,
+        syn_pkt.ip.daddr, syn_pkt.tcp.dest,
+        1280);
+    CHECK(pmtu_handled, "second PMTU update processed");
+    CHECK(r_syn.session->params.mss == 1240, "MSS reduced to 1240 (1280 - 40B)");
+
+    // 3. Low MTU clamped to RFC minimum IPv4 MSS (536 bytes)
+    pmtu_handled = engine.handle_icmp_pmtu(
+        syn_pkt.ip.saddr, syn_pkt.tcp.source,
+        syn_pkt.ip.daddr, syn_pkt.tcp.dest,
+        300);
+    CHECK(pmtu_handled, "clamped PMTU update processed");
+    CHECK(r_syn.session->params.mss == 536, "MSS clamped to minimum 536 bytes");
+
+    // 4. ICMP PMTU for non-existent flow returns false
+    bool unknown_flow = engine.handle_icmp_pmtu(
+        inet_addr("192.168.1.1"), htons(1234),
+        syn_pkt.ip.daddr, syn_pkt.tcp.dest,
+        1400);
+    CHECK(!unknown_flow, "PMTU for non-existent session ignored");
+}
+
 int main() {
     test_resegmented_retransmission();
     test_conflicting_overlap_detected();
@@ -296,7 +699,13 @@ int main() {
     test_tcp_checksum();
     test_syn_cookies();
     test_domain_policy();
+    test_memory_budget();
+    test_stun_server();
+    test_tcp_sack();
+    test_icmp_pmtu_discovery();
+    test_tcp_window_scaling();
 
+    
     std::printf("\n%s (%d failure%s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures,
                 g_failures == 1 ? "" : "s");
     return g_failures ? 1 : 0;

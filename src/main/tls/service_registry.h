@@ -27,14 +27,17 @@ This single line ensures your server only communicates using modern, unbreakable
 #pragma once
 
 #include "aethon/aethon.h"
+#include "config/constants.h"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/types.h>
@@ -42,6 +45,7 @@ This single line ensures your server only communicates using modern, unbreakable
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 #include "aethon/single_thread_hasmap.h"
 
 
@@ -53,6 +57,8 @@ struct ServiceConfig {
   std::string cert_path;
   std::string key_path;
   uint16_t backend_port{0};
+  std::string protocol{"tcp"};
+  bool is_http{false};
   SSL_CTX *ssl_ctx{nullptr};
 
   ~ServiceConfig() {
@@ -97,11 +103,15 @@ inline SSL_CTX *create_ssl_context(const std::string &cert_path,
 
 class alignas(implementation::hardware_destructive_interference_size) ServiceRegistry{
     private:
-        static constexpr size_t MAX_SERVICES = 256;
+        static constexpr size_t MAX_SERVICES = config::tls::MAX_SERVICES;
         alignas(implementation::hardware_destructive_interference_size) std::array<ServiceConfig, MAX_SERVICES> services_{};
         size_t service_count_{0};
 
         using ServiceMap = aethon::SingleThreadHashMap<uint64_t, const ServiceConfig *,0>;
+
+        //  domain to serviceConfig
+        //  ((IP, PORT)) --> ServiceConfig
+        
         ServiceMap domain_map_{MAX_SERVICES * 2};
         ServiceMap ip_port_map_{MAX_SERVICES * 2};
         alignas(64) std::array<bool, 65536> managed_ports_{};
@@ -125,7 +135,7 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
     public:
         ServiceRegistry () = default;
 
-        bool register_domain(std::string_view domain, const std::string &cert, const std::string &key, uint16_t backend_port){
+        bool register_domain(std::string_view domain, const std::string &cert, const std::string &key, uint16_t backend_port, const std::string &proto = "tcp"){
             if(service_count_ >= MAX_SERVICES){
                 return false;
             }
@@ -141,6 +151,10 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             services_[idx].cert_path = cert;
             services_[idx].key_path = key;
             services_[idx].backend_port = backend_port;
+            services_[idx].protocol = proto;
+            std::string p_lower = proto;
+            std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
+            services_[idx].is_http = (p_lower == "http" || p_lower == "https");
             services_[idx].ssl_ctx = ctx;
 
             const ServiceConfig *ptr = &services_[idx];
@@ -161,7 +175,7 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             return true;
         }
 
-        bool register_ip_port(const std::string &ip_str, uint16_t port, const std::string &cert, const std::string &key, uint16_t backend_port){
+        bool register_ip_port(const std::string &ip_str, uint16_t port, const std::string &cert, const std::string &key, uint16_t backend_port, const std::string &proto = "tcp"){
             if (service_count_ >= MAX_SERVICES) {
                 return false;
             }
@@ -181,6 +195,10 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             services_[idx].cert_path = cert;
             services_[idx].key_path = key;
             services_[idx].backend_port = backend_port;
+            services_[idx].protocol = proto;
+            std::string p_lower = proto;
+            std::transform(p_lower.begin(), p_lower.end(), p_lower.begin(), ::tolower);
+            services_[idx].is_http = (p_lower == "http" || p_lower == "https");
             services_[idx].ssl_ctx = ctx;
             const ServiceConfig *ptr = &services_[idx];
             uint64_t key_val = make_ip_port_key(addr.s_addr, port);
@@ -260,18 +278,22 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
             std::istringstream iss(line.substr(start));
             std::string id, cert, key;
             uint16_t backend_port = 0;
+            std::string proto = "tcp";
             if (!(iss >> id >> cert >> key >> backend_port)) {
                 continue;
+            }
+            if (iss >> proto) {
+                // Optional 5th token (e.g. "http" or "https")
             }
             size_t colon = id.find(':');
             if (colon != std::string::npos) {
                 std::string ip_str = id.substr(0, colon);
                 uint16_t listen_port = static_cast<uint16_t>(std::stoi(id.substr(colon + 1)));
-                if (register_ip_port(ip_str, listen_port, cert, key, backend_port)) {
+                if (register_ip_port(ip_str, listen_port, cert, key, backend_port, proto)) {
                     ++loaded;
                 }
             } else {
-                if (register_domain(id, cert, key, backend_port)) {
+                if (register_domain(id, cert, key, backend_port, proto)) {
                     ++loaded;
                 }
             }
@@ -284,8 +306,63 @@ class alignas(implementation::hardware_destructive_interference_size) ServiceReg
     }
         
 
-}  ;
+};
 
+/**
+ * @brief Thread-safe double-buffered holder for ServiceRegistry.
+ * Allows atomic zero-downtime hot reload on SIGHUP without locks on the packet hot path.
+ */
+class ServiceRegistryHolder {
+private:
+    std::atomic<const ServiceRegistry*> current_{nullptr};
+    std::vector<std::unique_ptr<const ServiceRegistry>> old_registries_;
+    std::mutex reload_mutex_;
 
+public:
+    ServiceRegistryHolder() = default;
+
+    size_t load_from_file(const std::string &filepath) {
+        std::lock_guard<std::mutex> lock(reload_mutex_);
+        auto draft = std::make_unique<ServiceRegistry>();
+        size_t count = draft->load_from_file(filepath);
+        if (count == 0) {
+            std::cerr << "[Registry] Hot-reload failed: 0 valid services loaded from " << filepath << "\n";
+            return 0;
+        }
+        const ServiceRegistry *ptr = draft.get();
+        old_registries_.push_back(std::move(draft));
+        current_.store(ptr, std::memory_order_release);
+        return count;
+    }
+
+    AETHON_ALWAYS_INLINE const ServiceRegistry *get() const noexcept {
+        return current_.load(std::memory_order_acquire);
+    }
+
+    AETHON_ALWAYS_INLINE bool is_managed_port(uint16_t port) const noexcept {
+        const auto *reg = get();
+        return reg ? reg->is_managed_port(port) : false;
+    }
+
+    AETHON_ALWAYS_INLINE const ServiceConfig *find_by_domain(std::string_view domain) const noexcept {
+        const auto *reg = get();
+        return reg ? reg->find_by_domain(domain) : nullptr;
+    }
+
+    AETHON_ALWAYS_INLINE const ServiceConfig *find_by_ip_port(uint32_t ip, uint16_t port) const noexcept {
+        const auto *reg = get();
+        return reg ? reg->find_by_ip_port(ip, port) : nullptr;
+    }
+
+    std::vector<uint16_t> get_listening_ports() const {
+        const auto *reg = get();
+        return reg ? reg->get_listening_ports() : std::vector<uint16_t>{};
+    }
+
+    AETHON_ALWAYS_INLINE size_t size() const noexcept {
+        const auto *reg = get();
+        return reg ? reg->size() : 0;
+    }
+};
 
 } // namespace aethon::service

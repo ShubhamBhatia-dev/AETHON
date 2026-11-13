@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include "aethon/aethon.h"
+#include "config/constants.h"
 
 #ifndef AETHON_ALWAYS_INLINE
 #if defined(__GNUC__) || defined(__clang__)
@@ -31,26 +32,26 @@ namespace tcp {
      */
     class alignas(16) TcpRenoCongestionControl {
     public:
-        static constexpr uint32_t DEFAULT_MSS = 1460;
-        static constexpr uint32_t INITIAL_CWND_SEGMENTS = 10; // RFC 6928 initcwnd = 10 MSS (~14.6 KB)
+        static constexpr uint32_t DEFAULT_MSS = config::tcp::DEFAULT_MSS;
+        static constexpr uint32_t INITIAL_CWND_SEGMENTS = config::tcp::INITIAL_CWND_SEGMENTS; // RFC 6928 initcwnd = 10 MSS (~14.6 KB)
 
         uint32_t cwnd{INITIAL_CWND_SEGMENTS * DEFAULT_MSS};   // Congestion window in bytes
-        uint32_t ssthresh{65535};                            // Slow-start threshold in bytes
+        uint32_t ssthresh{1024 * 1024};                      // Slow-start threshold in bytes (starts at 1 MB for high throughput)
         uint32_t mss{DEFAULT_MSS};                           // Maximum segment size
 
         TcpRenoCongestionControl() noexcept = default;
         explicit TcpRenoCongestionControl(uint32_t segment_size) noexcept 
-            : cwnd(INITIAL_CWND_SEGMENTS * segment_size), ssthresh(65535), mss(segment_size) {}
+            : cwnd(INITIAL_CWND_SEGMENTS * segment_size), ssthresh(1024 * 1024), mss(segment_size) {}
 
         /**
          * @brief Advance congestion window upon receiving a cumulative forward ACK.
          * 
-         * - Slow Start (cwnd < ssthresh): Exponential growth.
+         * - Slow Start (cwnd < ssthresh): Exponential growth with Appropriate Byte Counting (RFC 3465).
          * - Congestion Avoidance (cwnd >= ssthresh): Additive increase (~1 MSS per RTT).
          */
         AETHON_ALWAYS_INLINE void on_ack(size_t bytes_acked) noexcept {
             if (cwnd < ssthresh) {
-                cwnd += static_cast<uint32_t>(std::min<size_t>(bytes_acked, mss));
+                cwnd += static_cast<uint32_t>(bytes_acked);
             } else {
                 uint32_t inc = (mss * mss) / cwnd;
                 cwnd += (inc > 0) ? inc : 1;

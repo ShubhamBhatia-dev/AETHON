@@ -53,6 +53,81 @@ http {
         location /api/ {
             proxy_pass http://node_backend;
             proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_read_timeout 60s;
+        }
+    }
+
+    server {
+        listen 127.0.0.1:8443 ssl;
+        server_name _;
+
+        ssl_certificate     __ROOT__/certs/server.crt;
+        ssl_certificate_key __ROOT__/certs/server.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+
+        root __PUBLIC_DIR__;
+        index index.html;
+
+        location /files/ {
+            alias __RUN_DIR__/files/;
+        }
+
+        location /api/ {
+            proxy_pass http://node_backend;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_read_timeout 60s;
+        }
+    }
+
+    # ----------------------------------------------------------------------
+    # BENCHMARK-ONLY: fair baseline listeners on the veth IP.
+    # These let compare_fair.sh reach nginx DIRECTLY over the same veth wire
+    # (same 1500 MTU, offloads off, through the kernel TCP stack) that Aethon
+    # uses — instead of over loopback. Aethon manages ports 80/443/8443, so the
+    # XDP program passes 8081/8444 straight to the kernel. Not part of the
+    # security posture: the protected site is still loopback-only above.
+    # ----------------------------------------------------------------------
+    server {
+        listen 0.0.0.0:8081;
+        server_name _;
+        root __PUBLIC_DIR__;
+        index index.html;
+        location /files/ { alias __RUN_DIR__/files/; }
+        location /api/ {
+            proxy_pass http://node_backend;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_request_buffering off;
+            proxy_set_header Connection "";
+            proxy_set_header Host $host;
+            proxy_read_timeout 60s;
+        }
+    }
+
+    server {
+        listen 0.0.0.0:8444 ssl;
+        server_name _;
+        ssl_certificate     __ROOT__/certs/server.crt;
+        ssl_certificate_key __ROOT__/certs/server.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        root __PUBLIC_DIR__;
+        index index.html;
+        location /files/ { alias __RUN_DIR__/files/; }
+        location /api/ {
+            proxy_pass http://node_backend;
+            proxy_http_version 1.1;
+            proxy_buffering off;
+            proxy_request_buffering off;
             proxy_set_header Connection "";
             proxy_set_header Host $host;
             proxy_read_timeout 60s;

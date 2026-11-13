@@ -727,7 +727,8 @@ namespace aethon {
         enum class LoadMode : uint8_t {
             BLOCK,   // every match resets the connection (local/custom rules)
             POLICY,  // reset only for attack classes / high severity / drop rules, otherwise log
-            ALERT    // log only
+            ALERT,   // log only
+            CUSTOM   // user-managed custom rules: drop/reject block, alert logs only; short patterns allowed
         };
 
         struct LoadStats {
@@ -776,9 +777,10 @@ namespace aethon {
 
                 const bool high_severity = r.severity == "Major" || r.severity == "Critical";
                 const bool drop_action = r.action == RuleAction::DROP || r.action == RuleAction::REJECT;
-                r.block = mode == LoadMode::BLOCK ||
+                r.block = (mode == LoadMode::BLOCK) ||
+                          (mode == LoadMode::CUSTOM && drop_action) ||
                           (mode == LoadMode::POLICY && (drop_action || high_severity || is_attack_class(r.classtype)));
-                r.trusted = mode == LoadMode::BLOCK;
+                r.trusted = (mode == LoadMode::BLOCK || mode == LoadMode::CUSTOM);
                 st.blocking += r.block;
                 ++st.loaded;
                 rules_.push_back(std::move(r));

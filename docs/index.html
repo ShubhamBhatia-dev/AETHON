@@ -136,7 +136,7 @@
  │ KERNEL SPACE: eBPF / XDP Driver Hook (src/main/xdp_kern_prog.c)        │
  │                                                                        │
  │  1. Parse Ethernet + IPv4 Header                                       │
- │  2. IP Blocklist Check (BPF_MAP_TYPE_HASH: aethon_ip_blockist)         │
+ │  2. IP Blocklist Check (BPF_MAP_TYPE_HASH: aethon_ip_blocklist)        │
  │     └─ Hit: Return XDP_DROP (Zero CPU overhead)                        │
  │  3. Token-Bucket Rate Limiter (BPF_MAP_TYPE_PERCPU_HASH)               │
  │     └─ Exceeded: Return XDP_DROP                                       │

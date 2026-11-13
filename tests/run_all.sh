@@ -3,6 +3,9 @@
 #
 #   tests/run_all.sh            offline tests; live tests too if sudo is available
 #   tests/run_all.sh --offline  only the offline tests (no root, no network)
+#   tests/run_all.sh --internal same as --offline (internal unit/regression tests)
+#   tests/run_all.sh --no-build skip the cmake build step and run existing binaries
+#   tests/run_all.sh --fast     skip build + only internal tests (--internal --no-build)
 #   tests/run_all.sh --full     live suite runs torture.sh --long as well
 #
 # Offline tests need nothing. Live tests need root (XDP/AF_XDP), nginx and node,
@@ -14,12 +17,15 @@ ROOT="$(cd "$DIR/.." && pwd)"
 cd "$ROOT"
 
 OFFLINE_ONLY=0
+NO_BUILD=0
 TORTURE_ARGS="--quick"
 for a in "$@"; do
   case "$a" in
-    --offline) OFFLINE_ONLY=1 ;;
+    --offline|--internal) OFFLINE_ONLY=1 ;;
+    --no-build|--test-only) NO_BUILD=1 ;;
+    --fast) OFFLINE_ONLY=1; NO_BUILD=1 ;;
     --full) TORTURE_ARGS="--long" ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
   esac
 done
 
@@ -32,12 +38,16 @@ run() {  # run <label> <cmd...>
   if "${@:2}"; then grn "   ok"; else red "   FAILED: $1"; FAILED=1; fi
 }
 
-bold "═══ Build ═══"
-if ! cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1 || \
-   ! cmake --build build -j >/tmp/aethon_build.log 2>&1; then
-  red "build failed:"; tail -20 /tmp/aethon_build.log; exit 1
+if [[ $NO_BUILD -eq 0 ]]; then
+  bold "═══ Build ═══"
+  if ! cmake -B build -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1 || \
+     ! cmake --build build -j >/tmp/aethon_build.log 2>&1; then
+    red "build failed:"; tail -20 /tmp/aethon_build.log; exit 1
+  fi
+  grn "build ok"
+else
+  bold "═══ Skipping Build (--no-build) ═══"
 fi
-grn "build ok"
 
 bold "═══ Offline tests (no root) ═══"
 run "TCP reassembly regression" ./build/src/test_tcp_reassembly
@@ -67,28 +77,53 @@ if ! sudo -n true 2>/dev/null; then
   exit $FAILED
 fi
 
-# Bring up stack + Aethon, run suites, tear down. All inside a trap so Aethon is always stopped.
+# Clean up any rogue python test backends
+pkill -f multi_backend_server.py 2>/dev/null || true
+pkill -f flask_backend.py 2>/dev/null || true
+
+# Bring up stack + Aethon, run suites, tear down.
 AETHON_PID=""
+ALREADY_RUNNING=0
+if pgrep -f afxdp_control >/dev/null; then
+  ALREADY_RUNNING=1
+  AETHON_PID=$(pgrep -f afxdp_control | head -n1)
+fi
+
 cleanup() {
-  [[ -n "$AETHON_PID" ]] && sudo kill "$AETHON_PID" 2>/dev/null
+  if [[ $ALREADY_RUNNING -eq 0 && -n "$AETHON_PID" ]]; then
+    sudo kill "$AETHON_PID" 2>/dev/null || true
+  fi
   "$DIR/web_app_test/stop.sh" --net >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 run "web stack up (nginx + node + veth)" "$DIR/web_app_test/start.sh"
-bold "── starting Aethon on veth0"
-sudo ./build/src/afxdp_control veth0 >/tmp/aethon_run.log 2>&1 &
-AETHON_PID=$!
-sleep 3
-if ! sudo kill -0 "$AETHON_PID" 2>/dev/null; then
-  red "   Aethon failed to start:"; tail -20 /tmp/aethon_run.log; FAILED=1
+
+if [[ $ALREADY_RUNNING -eq 1 ]]; then
+  bold "── Aethon Gateway on veth0"
+  grn "   already running (pid $AETHON_PID)"
 else
-  grn "   Aethon running (pid $AETHON_PID)"
-  run "end-to-end (clean)"            "$DIR/web_app_test/test.sh"
-  run "end-to-end (50ms delay, 2% loss)" "$DIR/web_app_test/test.sh" --netem
-  run "torture suite"                 "$DIR/web_app_test/torture.sh" $TORTURE_ARGS
+  bold "── starting Aethon on veth0"
+  sudo ./build/src/afxdp_control veth0 >/tmp/aethon_run.log 2>&1 &
+  AETHON_PID=$!
+  sleep 3
+  if ! sudo kill -0 "$AETHON_PID" 2>/dev/null; then
+    red "   Aethon failed to start:"; tail -20 /tmp/aethon_run.log; FAILED=1
+  else
+    grn "   Aethon running (pid $AETHON_PID)"
+  fi
+fi
+
+if sudo kill -0 "$AETHON_PID" 2>/dev/null; then
+  run "end-to-end (clean fast-path)"               "$DIR/web_app_test/test.sh"
+  run "end-to-end (50ms delay, 2% loss network chaos)" "$DIR/web_app_test/test.sh" --netem
+  run "torture suite (chaos, jitter, edge cases)"  "$DIR/web_app_test/torture.sh" $TORTURE_ARGS
+  run "wire-speed throughput benchmark (multi-stream line rate)" "$DIR/speed_test.sh" --streams 8 --size 5 --duration 3
+  run "performance comparison: raw nginx vs aethon (with & without tls)" sudo "$DIR/compare_nginx_aethon.sh" --quick
+  run "zero-trust security interception & FluxIO audit WAL" sudo "$DIR/test_live.sh" --quick
+  run "functional features (routing, SNI, blocklist, integrity)" sudo "$DIR/test_features.sh"
   bold "── Aethon event counters (why connections were reset/dropped)"
-  grep -h "\[Events\]" /tmp/aethon_run.log | tail -3 || echo "   (none)"
+  grep -h "\[Events\]" /tmp/aethon_run.log 2>/dev/null | tail -3 || echo "   (none)"
 fi
 
 echo
