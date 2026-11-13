@@ -56,6 +56,8 @@ namespace http {
             return false;
         }
 
+        // POST /search/items?q=shoes&page=2 HTTP/1.1\r\nHost: api.com\r\n\r\n{"body":"data"}
+        
         static bool parse(const uint8_t *data, size_t len, ParsedHttpRequest &out) noexcept {
             if (AETHON_UNLIKELY(!data || len < 14)) return false;
             std::string_view raw(reinterpret_cast<const char *>(data), len);
@@ -63,17 +65,26 @@ namespace http {
             size_t first_crlf = raw.find("\r\n");
             if (AETHON_UNLIKELY(first_crlf == std::string_view::npos)) return false;
             out.request_line = raw.substr(0, first_crlf);
+            // out.request_line = "POST /search/items?q=shoes&page=2 HTTP/1.1"
+
             size_t sp1 = out.request_line.find(' ');
             if (AETHON_UNLIKELY(sp1 == std::string_view::npos || sp1 == 0)) return false;
             out.method = out.request_line.substr(0, sp1);
+            // out.method = "POST"
+
             size_t sp2 = out.request_line.find(' ', sp1 + 1);
             if (AETHON_UNLIKELY(sp2 == std::string_view::npos)) return false;
-            out.raw_uri = out.request_line.substr(sp1 + 1, sp2 - sp1 - 1);
+            out.raw_uri = out.request_line.substr(sp1 + 1, sp2 - sp1 - 1); 
+            // out.raw_uri = "/search/items?q=shoes&page=2"
+
             out.version = out.request_line.substr(sp2 + 1);
+
+            // out.version = "HTTP/1.1"
+
             size_t qmark = out.raw_uri.find('?');
             if (qmark != std::string_view::npos) {
-                out.path = out.raw_uri.substr(0, qmark);
-                out.query = out.raw_uri.substr(qmark + 1);
+                out.path = out.raw_uri.substr(0, qmark);   // "/search/items"
+                out.query = out.raw_uri.substr(qmark + 1);   // "q=shoes&page=2"
             } else {
                 out.path = out.raw_uri;
                 out.query = {};
@@ -82,7 +93,7 @@ namespace http {
             size_t header_end = raw.find("\r\n\r\n");
             if (header_end != std::string_view::npos) {
                 out.all_headers = raw.substr(first_crlf + 2, header_end - (first_crlf + 2));
-                out.body = raw.substr(header_end + 4);
+                out.body = raw.substr(header_end + 4);  // Everything after \r\n\r\n is the BODY!
             } else {
                 out.all_headers = raw.substr(first_crlf + 2);
                 out.body = {};
