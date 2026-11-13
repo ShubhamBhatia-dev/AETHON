@@ -1,0 +1,1 @@
+sudo ip netns exec client_ns python3 tests/test_app_layer.py 192.168.50.1 192.168.50.2 veth1

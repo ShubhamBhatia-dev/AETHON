@@ -25,6 +25,7 @@
 #include <pthread.h>
 #include <poll.h>
 #include "udp_assembler.h"
+#include "dns_parser.h"
 #include "ip_address.h"
 #include "tcp_pipeline.h"
 #include <bpf/bpf.h>
@@ -390,8 +391,25 @@ void rx_worker(Engine &engine, int queue_id) {
                   goto recycle_slot;
                 }
 
-                // 2. All other UDP ports: Hyperscan DPI inspection
+                // 2. All other UDP ports: DNS & Hyperscan DPI inspection
                 if (AETHON_LIKELY(udp_app_len > 0)) {
+                  if (dns::DnsParser::is_dns_port(ntohs(udph->source), ntohs(udph->dest))) {
+                    dns::ParsedDnsQuery dns_query;
+                    if (dns::DnsParser::parse_query(udp_app_payload, udp_app_len, dns_query)) {
+                      if (AETHON_UNLIKELY(!pipeline::g_domain_blocklist.is_allowed(dns_query.domain()))) {
+                        std::cout << "\n[IPS BLOCK] Unauthorized / Blocklisted DNS Query! Domain: " << dns_query.domain() << std::endl;
+                        goto recycle_slot;
+                      }
+                      bool dns_blocked = scanner.scan(reinterpret_cast<const uint8_t*>(dns_query.domain().data()), dns_query.domain().size()) ||
+                                         (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                          custom_scanner.scan(reinterpret_cast<const uint8_t*>(dns_query.domain().data()), dns_query.domain().size()));
+                      if (AETHON_UNLIKELY(dns_blocked)) {
+                        std::cout << "\n[IPS BLOCK] Malicious DNS Query (Hyperscan)! Domain: " << dns_query.domain() << std::endl;
+                        goto recycle_slot;
+                      }
+                    }
+                  }
+
                   bool is_blocked = scanner.scan(udp_app_payload, udp_app_len) ||
                                     (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
                                      custom_scanner.scan(udp_app_payload, udp_app_len));
@@ -428,22 +446,50 @@ void rx_worker(Engine &engine, int queue_id) {
 
               if (AETHON_UNLIKELY(res.is_complete)) {
                 // Reassembled Datagram: Full payload available for Hyperscan scanning
-                if (AETHON_LIKELY(res.payload_len > 0)) {
-                  bool is_blocked = scanner.scan(res.payload, res.payload_len) ||
-                                    (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
-                                     custom_scanner.scan(res.payload, res.payload_len));
-                  if (AETHON_UNLIKELY(is_blocked)) {
-                    std::cout << "\n[IPS BLOCK] ATTACK DETECTED: Malicious Fragmented UDP Datagram Dropped!" << std::endl;
-                    stats::count(stats::Event::RstDpiMatch);
-                    char s_ip[INET_ADDRSTRLEN], d_ip[INET_ADDRSTRLEN];
-                    inet_ntop(AF_INET, &iph->saddr, s_ip, sizeof(s_ip));
-                    inet_ntop(AF_INET, &iph->daddr, d_ip, sizeof(d_ip));
-                    aethon::log::log_event("CRITICAL", "UDP_IDS", "DPI_ATTACK_DETECTED",
-                                           s_ip, 0,
-                                           d_ip, 0,
-                                           "UDP", "DROP", "ATTACK DETECTED: Malicious fragmented UDP datagram intercepted & dropped by DPI");
-                    assembler.release_completed(res);
-                    goto recycle_slot;
+                if (AETHON_LIKELY(res.payload_len >= sizeof(struct udphdr))) {
+                  const struct udphdr *reassembled_udph = reinterpret_cast<const struct udphdr *>(res.payload);
+                  const uint8_t *udp_app_payload = res.payload + sizeof(struct udphdr);
+                  size_t udp_app_len = res.payload_len - sizeof(struct udphdr);
+
+                  if (AETHON_LIKELY(udp_app_len > 0)) {
+                    // Application Layer (DNS) Dissection on Port 53
+                    if (dns::DnsParser::is_dns_port(ntohs(reassembled_udph->source), ntohs(reassembled_udph->dest))) {
+                      dns::ParsedDnsQuery dns_query;
+                      if (dns::DnsParser::parse_query(udp_app_payload, udp_app_len, dns_query)) {
+                        // 1. Check against Domain Blocklist (e.g. C2, malicious domains)
+                        if (AETHON_UNLIKELY(!pipeline::g_domain_blocklist.is_allowed(dns_query.domain()))) {
+                          std::cout << "\n[IPS BLOCK] Unauthorized / Blocklisted DNS Query (Fragmented)! Domain: " << dns_query.domain() << std::endl;
+                          assembler.release_completed(res);
+                          goto recycle_slot;
+                        }
+                        // 2. Scan decoded domain name with Hyperscan rules
+                        bool dns_blocked = scanner.scan(reinterpret_cast<const uint8_t*>(dns_query.domain().data()), dns_query.domain().size()) ||
+                                           (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                            custom_scanner.scan(reinterpret_cast<const uint8_t*>(dns_query.domain().data()), dns_query.domain().size()));
+                        if (AETHON_UNLIKELY(dns_blocked)) {
+                          std::cout << "\n[IPS BLOCK] Malicious DNS Query (Hyperscan, Fragmented)! Domain: " << dns_query.domain() << std::endl;
+                          assembler.release_completed(res);
+                          goto recycle_slot;
+                        }
+                      }
+                    }
+
+                    bool is_blocked = scanner.scan(udp_app_payload, udp_app_len) ||
+                                      (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                       custom_scanner.scan(udp_app_payload, udp_app_len));
+                    if (AETHON_UNLIKELY(is_blocked)) {
+                      std::cout << "\n[IPS BLOCK] ATTACK DETECTED: Malicious Fragmented UDP Datagram Dropped!" << std::endl;
+                      stats::count(stats::Event::RstDpiMatch);
+                      char s_ip[INET_ADDRSTRLEN], d_ip[INET_ADDRSTRLEN];
+                      inet_ntop(AF_INET, &iph->saddr, s_ip, sizeof(s_ip));
+                      inet_ntop(AF_INET, &iph->daddr, d_ip, sizeof(d_ip));
+                      aethon::log::log_event("CRITICAL", "UDP_IDS", "DPI_ATTACK_DETECTED",
+                                             s_ip, 0,
+                                             d_ip, 0,
+                                             "UDP", "DROP", "ATTACK DETECTED: Malicious fragmented UDP datagram intercepted & dropped by DPI");
+                      assembler.release_completed(res);
+                      goto recycle_slot;
+                    }
                   }
                 }
 

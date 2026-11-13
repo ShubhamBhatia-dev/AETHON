@@ -34,6 +34,8 @@
 #include <cassert>
 #include "tls_engine.h"
 #include "tls_parser.h"
+#include "http_parser.h"
+#include "ssh_parser.h"
 #include "domain_blocklist.h"
 #include "aethon/single_thread_hasmap.h"
 #include <chrono>
@@ -503,7 +505,7 @@ namespace pipeline {
 
         IPv4TcpAssembler::TcpAssemblyResult res = tcp_engine.process_packet(
             iph, tcph, payload, payload_len, now_ns);
-
+            
         if (AETHON_UNLIKELY(res.syn_cookie)) {
             if (!g_service_registry.is_managed_port(ntohs(tcph->dest))) {
                 return false;
@@ -769,6 +771,47 @@ namespace pipeline {
                     int plain_len;
                     while ((plain_len = res.session->tls_conn.decrypt(plain_buf, sizeof(plain_buf))) > 0) {
                         any_decrypted = true;
+                        if (http::HttpParser::is_http_request(plain_buf, static_cast<size_t>(plain_len))) {
+                            http::ParsedHttpRequest http_req;
+                            if (http::HttpParser::parse(plain_buf, static_cast<size_t>(plain_len), http_req)) {
+                                std::string_view norm_path = http_req.get_normalized_path();
+                                if (!norm_path.empty()) {
+                                    bool path_malicious = scanner.scan(reinterpret_cast<const uint8_t*>(norm_path.data()), norm_path.size()) ||
+                                                          (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                                           custom_scanner.scan(reinterpret_cast<const uint8_t*>(norm_path.data()), norm_path.size()));
+                                    if (AETHON_UNLIKELY(path_malicious)) {
+                                        std::cout << "\n[IPS BLOCK] Malicious HTTP URI (Hyperscan) in Decrypted TLS Stream!" << std::endl;
+                                        std::cout << "  URI      : " << http_req.raw_uri << std::endl;
+                                        std::cout << "  Decoded  : " << norm_path << std::endl;
+                                        std::cout << "  Attacker : ";
+                                        print_ip(iph->saddr);
+                                        std::cout << ":" << ntohs(tcph->source) << std::endl;
+
+                                        tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                                        stats::count(stats::Event::RstDpiMatch);
+                                        return net::PacketInjector::ipv4_send_tcp_rst(
+                                            sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                                    }
+                                }
+                                if (!http_req.body.empty()) {
+                                    bool body_malicious = scanner.scan(reinterpret_cast<const uint8_t*>(http_req.body.data()), http_req.body.size()) ||
+                                                          (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                                           custom_scanner.scan(reinterpret_cast<const uint8_t*>(http_req.body.data()), http_req.body.size()));
+                                    if (AETHON_UNLIKELY(body_malicious)) {
+                                        std::cout << "\n[IPS BLOCK] Malicious HTTP Body Payload (Hyperscan) in Decrypted TLS Stream!" << std::endl;
+                                        std::cout << "  Attacker : ";
+                                        print_ip(iph->saddr);
+                                        std::cout << ":" << ntohs(tcph->source) << std::endl;
+
+                                        tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                                        stats::count(stats::Event::RstDpiMatch);
+                                        return net::PacketInjector::ipv4_send_tcp_rst(
+                                            sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                                    }
+                                }
+                            }
+                        }
+
                         bool attack_detected = scan_payload_with_dpi(
                             res.session, scanner, custom_scanner, custom_gen_id, plain_buf, static_cast<size_t>(plain_len));
                         if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(attack_detected, 1, 0.0001)) {
@@ -846,8 +889,90 @@ namespace pipeline {
                         sock, buf_addr, pkt, eth, iph, tcph, res.session->send_nxt, res.session->rcv_nxt, res.session->recv_window());
                 }
             } else {
+                bool attack_detected = false;
+                if (http::HttpParser::is_http_request(hello_data, hello_len)) {
+                    http::ParsedHttpRequest http_req;
+                    if (http::HttpParser::parse(hello_data, hello_len, http_req)) {
+                        std::string_view norm_path = http_req.get_normalized_path();
+                        // Scan parsed & normalized URI directly with Hyperscan
+                        if (!norm_path.empty()) {
+                            bool path_malicious = scanner.scan(reinterpret_cast<const uint8_t*>(norm_path.data()), norm_path.size()) ||
+                                                  (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                                   custom_scanner.scan(reinterpret_cast<const uint8_t*>(norm_path.data()), norm_path.size()));
+                            if (AETHON_UNLIKELY(path_malicious)) {
+                                std::cout << "\n[IPS BLOCK] Malicious HTTP URI (Hyperscan)!" << std::endl;
+                                std::cout << "  URI      : " << http_req.raw_uri << std::endl;
+                                std::cout << "  Decoded  : " << norm_path << std::endl;
+                                std::cout << "  Attacker : ";
+                                print_ip(iph->saddr);
+                                std::cout << ":" << ntohs(tcph->source) << std::endl;
+
+                                if (res.session) {
+                                    res.session->client_hello_buf.clear();
+                                }
+                                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                                stats::count(stats::Event::RstDpiMatch);
+                                return net::PacketInjector::ipv4_send_tcp_rst(
+                                    sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                            }
+                        }
+                        if (!http_req.body.empty()) {
+                            bool body_malicious = scanner.scan(reinterpret_cast<const uint8_t*>(http_req.body.data()), http_req.body.size()) ||
+                                                  (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                                   custom_scanner.scan(reinterpret_cast<const uint8_t*>(http_req.body.data()), http_req.body.size()));
+                            if (AETHON_UNLIKELY(body_malicious)) {
+                                std::cout << "\n[IPS BLOCK] Malicious HTTP Body Payload (Hyperscan)!" << std::endl;
+                                std::cout << "  Attacker : ";
+                                print_ip(iph->saddr);
+                                std::cout << ":" << ntohs(tcph->source) << std::endl;
+
+                                if (res.session) {
+                                    res.session->client_hello_buf.clear();
+                                }
+                                tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                                stats::count(stats::Event::RstDpiMatch);
+                                return net::PacketInjector::ipv4_send_tcp_rst(
+                                    sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                            }
+                        }
+                    }
+                }
+                else if (ssh::SshParser::is_ssh_protocol(hello_data, hello_len)) {
+                    ssh::ParsedSshBanner ssh_info;
+                    if (ssh::SshParser::parse_banner(hello_data, hello_len, ssh_info)) {
+                        bool is_ssh_exploit = false;
+                        if (!ssh_info.software.empty()) {
+                            is_ssh_exploit = scanner.scan(reinterpret_cast<const uint8_t*>(ssh_info.software.data()), ssh_info.software.size()) ||
+                                             (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                              custom_scanner.scan(reinterpret_cast<const uint8_t*>(ssh_info.software.data()), ssh_info.software.size()));
+                        }
+                        if (!is_ssh_exploit && !ssh_info.raw_banner.empty()) {
+                            is_ssh_exploit = scanner.scan(reinterpret_cast<const uint8_t*>(ssh_info.raw_banner.data()), ssh_info.raw_banner.size()) ||
+                                             (AETHON_UNLIKELY(custom_scanner.is_ready()) &&
+                                              custom_scanner.scan(reinterpret_cast<const uint8_t*>(ssh_info.raw_banner.data()), ssh_info.raw_banner.size()));
+                        }
+
+                        if (AETHON_UNLIKELY(is_ssh_exploit)) {
+                            std::cout << "\n[IPS BLOCK] Malicious SSH Client / Banner (Hyperscan) Blocked!" << std::endl;
+                            std::cout << "  Banner   : " << ssh_info.raw_banner << std::endl;
+                            std::cout << "  Software : " << ssh_info.software << std::endl;
+                            std::cout << "  Attacker : ";
+                            print_ip(iph->saddr);
+                            std::cout << ":" << ntohs(tcph->source) << std::endl;
+
+                            if (res.session) {
+                                res.session->client_hello_buf.clear();
+                            }
+                            tcp_engine.close_session(iph->saddr, iph->daddr, tcph->source, tcph->dest);
+                            stats::count(stats::Event::RstDpiMatch);
+                            return net::PacketInjector::ipv4_send_tcp_rst(
+                                sock, buf_addr, pkt, eth, iph, tcph, payload_len);
+                        }
+                    }
+                }
+
                 // Forward and scan full assembled hello_data / hello_len (covers multi-segment ClientHello for plain/passthrough)
-                bool attack_detected = scan_payload_with_dpi(
+                attack_detected = scan_payload_with_dpi(
                     res.session, scanner, custom_scanner, custom_gen_id, hello_data, hello_len);
                 if (AETHON_BUILTIN_EXPECT_WITH_PROBABILITY(attack_detected, 1, 0.0001)) {
                     std::cout << "\n[IPS BLOCK] Malicious TCP Packet Dropped!" << std::endl;

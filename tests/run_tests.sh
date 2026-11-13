@@ -29,6 +29,7 @@ show_menu() {
     echo "14) Full Functional TLS Test: Random Packets, Malicious Exploits & Flask Proxy"
     echo "15) Multi-Port Reverse Proxy Test: Ports 5000, 6000 & 8080 Routing"
     echo "16) Python TLS JA3 Fingerprint Rate Limiting Test"
+    echo "17) Python Application-Layer Dissection Test (HTTP, SSH, DNS & TLS)"
     echo "q) Exit"
     echo "=================================================="
 }
@@ -115,7 +116,11 @@ run_choice() {
             ;;
         16)
             echo "🚀 Launching TLS JA3 Fingerprint Rate Limiting Test..."
-            sudo ip netns exec client_ns python3 tests/test_ja3_rate_limit.py 192.168.50.1 192.168.50.2 veth1 mydomain.com
+            sudo ip netns exec client_ns python3 tests/test_ja3_rate_limit.py 192.168.50.1 443 mydomain.com
+            ;;
+        17)
+            echo "🚀 Launching Application-Layer Protocol Verification Test (HTTP, SSH, DNS & TLS)..."
+            sudo ip netns exec client_ns python3 tests/test_app_layer.py 192.168.50.1 192.168.50.2 veth1
             ;;
         q|Q)
             exit 0
@@ -131,7 +136,7 @@ if [ -n "$1" ]; then
     run_choice "$1"
 else
     show_menu
-    read -rp "Select test [1-16, q]: " CHOICE
+    read -rp "Select test [1-17, q]: " CHOICE
     run_choice "$CHOICE"
 fi
 

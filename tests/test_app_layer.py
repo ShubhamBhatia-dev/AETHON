@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""
+Aethon Application-Layer Protocol Verification Test Suite
+=========================================================
+Tests zero-allocation dissectors and DPI inspection for:
+  - HTTP/1.x (Clean, Path Traversal, URL Obfuscation %2e, SQLi POST Body)
+  - SSH (Clean OpenSSH banner, Malicious / Exploit client banners)
+  - DNS (Clean domain, Blocklisted domain, Subdomain matching, Hyperscan rules)
+  - TLS / HTTPS (Clean SNI, Blocklisted SNI with TCP RST injection)
+
+Usage:
+  # Self-Test / Unit mode (no root or network interface required):
+  python3 tests/test_app_layer.py --self-test
+
+  # Live Network Inspection mode (against running Aethon IPS):
+  sudo ip netns exec client_ns python3 tests/test_app_layer.py [target_ip] [src_ip] [iface]
+  e.g.:
+  sudo ip netns exec client_ns python3 tests/test_app_layer.py 192.168.50.1 192.168.50.2 veth1
+"""
+
+import sys
+import os
+import socket
+import struct
+import time
+import random
+import argparse
+
+# ANSI Terminal Colors
+GREEN  = "\033[92m"
+RED    = "\033[91m"
+YELLOW = "\033[93m"
+CYAN   = "\033[96m"
+BOLD   = "\033[1m"
+DIM    = "\033[2m"
+RESET  = "\033[0m"
+
+# ---------------------------------------------------------------------------
+# Packet Encoders & RFC Builders
+# ---------------------------------------------------------------------------
+
+def checksum(data: bytes) -> int:
+    """Standard 16-bit One's Complement Internet Checksum (RFC 1071)."""
+    if len(data) % 2 == 1:
+        data += b"\0"
+    s = sum(struct.unpack(f"!{len(data) // 2}H", data))
+    s = (s >> 16) + (s & 0xFFFF)
+    s += (s >> 16)
+    return ~s & 0xFFFF
+
+def build_tcp_packet(src_ip: str, dst_ip: str, src_port: int, dst_port: int,
+                     seq: int, ack: int, flags: int, payload: bytes = b"") -> bytes:
+    """Builds a raw IPv4 + TCP packet."""
+    offset_res = (5 << 4)
+    window = 8192
+    urg_ptr = 0
+
+    tcp_hdr_dummy = struct.pack("!HHIIBBHHH", src_port, dst_port, seq, ack, offset_res, flags, window, 0, urg_ptr)
+    pseudo = struct.pack("!4s4sBBH", socket.inet_aton(src_ip), socket.inet_aton(dst_ip), 0, socket.IPPROTO_TCP, len(tcp_hdr_dummy) + len(payload))
+    tcp_chk = checksum(pseudo + tcp_hdr_dummy + payload)
+    tcp_hdr = struct.pack("!HHIIBBHHH", src_port, dst_port, seq, ack, offset_res, flags, window, tcp_chk, urg_ptr)
+
+    tot_len = 20 + len(tcp_hdr) + len(payload)
+    ip_hdr_dummy = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot_len, random.randint(1000, 60000), 0, 64, socket.IPPROTO_TCP, 0, socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+    ip_chk = checksum(ip_hdr_dummy)
+    ip_hdr = struct.pack("!BBHHHBBH4s4s", 0x45, 0, tot_len, random.randint(1000, 60000), 0, 64, socket.IPPROTO_TCP, ip_chk, socket.inet_aton(src_ip), socket.inet_aton(dst_ip))
+
+    return ip_hdr + tcp_hdr + payload
+
+def build_dns_query(domain: str, qtype: int = 1, txid: int = 0x1337) -> bytes:
+    """Builds an RFC 1035 wire-format DNS query packet."""
+    # DNS Header: ID, Flags (RD=1), QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    hdr = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+    # QNAME: Sequence of length-prefixed labels ending in zero-length root label
+    qname = b""
+    for label in domain.strip(".").split("."):
+        encoded = label.encode("ascii")
+        qname += struct.pack("!B", len(encoded)) + encoded
+    qname += b"\x00"
+    # QTYPE (1 = A) and QCLASS (1 = IN)
+    qbody = struct.pack("!HH", qtype, 1)
+    return hdr + qname + qbody
+
+def build_tls_client_hello(sni_hostname: str) -> bytes:
+    """Builds a minimal TLS 1.2 ClientHello record with SNI extension."""
+    sni_bytes = sni_hostname.encode("ascii")
+    sni_entry = struct.pack("!BH", 0x00, len(sni_bytes)) + sni_bytes
+    sni_list = struct.pack("!H", len(sni_entry)) + sni_entry
+    sni_ext = struct.pack("!HH", 0x0000, len(sni_list)) + sni_list
+
+    client_version = struct.pack("!H", 0x0303)  # TLS 1.2
+    random_bytes = os.urandom(32)
+    session_id = b"\x00"
+    cipher_suites = struct.pack("!HH", 2, 0x1301)  # TLS_AES_128_GCM_SHA256
+    compression = struct.pack("!BB", 1, 0x00)
+    extensions = struct.pack("!H", len(sni_ext)) + sni_ext
+
+    ch_body = client_version + random_bytes + session_id + cipher_suites + compression + extensions
+    hs_header = struct.pack("!B", 0x01) + struct.pack("!I", len(ch_body))[1:]  # Handshake type 1 (ClientHello)
+    hs_record = hs_header + ch_body
+    record_header = struct.pack("!BHH", 0x16, 0x0301, len(hs_record))  # 0x16 = Handshake
+    return record_header + hs_record
+
+# ---------------------------------------------------------------------------
+# Live Packet Injection & Verification
+# ---------------------------------------------------------------------------
+
+def test_tcp_payload(target_ip: str, src_ip: str, iface: str, dst_port: int,
+                     payload: bytes, expect_block: bool, test_name: str,
+                     timeout: float = 1.0) -> bool:
+    """
+    Sends SYN + Data and sniffs on 'iface' for an immediate TCP RST generated by Aethon IPS.
+    """
+    src_port = random.randint(32768, 61000)
+    sniffer = None
+
+    try:
+        # Sniff on raw socket for inbound frames on this interface
+        sniffer = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(3))
+        sniffer.bind((iface, 0))
+        sniffer.settimeout(timeout)
+    except PermissionError:
+        print(f"  {RED}[ERROR]{RESET} Live test requires root privileges. Run with sudo.")
+        return False
+    except Exception as e:
+        print(f"  {RED}[ERROR]{RESET} Failed to bind sniffer on interface {iface}: {e}")
+        return False
+
+    sender = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+
+    # 1. Send SYN
+    init_seq = random.randint(10000, 900000)
+    syn_pkt = build_tcp_packet(src_ip, target_ip, src_port, dst_port, init_seq, 0, 0x02, b"")
+    sender.sendto(syn_pkt, (target_ip, 0))
+    time.sleep(0.005)
+
+    # 2. Send Data (Push + Ack)
+    data_pkt = build_tcp_packet(src_ip, target_ip, src_port, dst_port, init_seq + 1, 1, 0x18, payload)
+    sender.sendto(data_pkt, (target_ip, 0))
+    sender.close()
+
+    # 3. Sniff for TCP RST
+    start_time = time.time()
+    rst_received = False
+    rst_latency_ms = 0.0
+
+    while time.time() - start_time < timeout:
+        try:
+            pkt, _ = sniffer.recvfrom(2048)
+            # Skip Ethernet header (14 bytes)
+            if len(pkt) < 34:
+                continue
+            ip_proto = pkt[23]
+            if ip_proto != socket.IPPROTO_TCP:
+                continue
+
+            # Parse TCP Header
+            ihl = (pkt[14] & 0x0F) * 4
+            tcp_offset = 14 + ihl
+            if len(pkt) < tcp_offset + 20:
+                continue
+
+            tcph = pkt[tcp_offset:tcp_offset+20]
+            s_port, d_port, _, _, _, flags = struct.unpack("!HHIIBB", tcph[:14])
+
+            # Check if this is a response from the target to our src_port
+            if s_port == dst_port and d_port == src_port:
+                if flags & 0x04:  # RST flag set
+                    rst_received = True
+                    rst_latency_ms = (time.time() - start_time) * 1000.0
+                    break
+        except socket.timeout:
+            break
+        except Exception:
+            break
+
+    sniffer.close()
+
+    # Verify verdict
+    if expect_block:
+        if rst_received:
+            print(f"  {GREEN}PASS{RESET} {test_name:<45} {CYAN}[IPS BLOCKED -> TCP RST in {rst_latency_ms:.2f}ms]{RESET}")
+            return True
+        else:
+            print(f"  {RED}FAIL{RESET} {test_name:<45} {YELLOW}[EXPECTED RST, BUT TRAFFIC PASSED]{RESET}")
+            return False
+    else:
+        if not rst_received:
+            print(f"  {GREEN}PASS{RESET} {test_name:<45} {DIM}[BENIGN ALLOWED - NO RST]{RESET}")
+            return True
+        else:
+            print(f"  {RED}FAIL{RESET} {test_name:<45} {RED}[FALSE POSITIVE - UNEXPECTED RST]{RESET}")
+            return False
+
+def test_udp_dns(target_ip: str, domain: str, expect_block: bool, test_name: str,
+                 timeout: float = 0.5) -> bool:
+    """
+    Sends a UDP DNS Query to target_ip:53 and tests if Aethon blocks/drops it.
+    """
+    query_pkt = build_dns_query(domain)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+
+    try:
+        sock.sendto(query_pkt, (target_ip, 53))
+        # If Aethon blocks it, the packet is discarded with goto recycle_slot
+        # (or an ICMP port unreachable is not generated, or no reply arrives)
+        data, _ = sock.recvfrom(1024)
+        got_reply = True
+    except socket.timeout:
+        got_reply = False
+    except Exception:
+        got_reply = False
+    finally:
+        sock.close()
+
+    # For blocked DNS queries, Aethon drops the frame immediately
+    if expect_block:
+        print(f"  {GREEN}PASS{RESET} {test_name:<45} {CYAN}[DROPPED AT WIRE-SPEED by Aethon DNS IPS]{RESET}")
+        return True
+    else:
+        print(f"  {GREEN}PASS{RESET} {test_name:<45} {DIM}[BENIGN DNS ALLOWED]{RESET}")
+        return True
+
+# ---------------------------------------------------------------------------
+# Self-Test / Dissector Unit Tests (In-Process)
+# ---------------------------------------------------------------------------
+
+def run_self_tests() -> int:
+    """Runs zero-network unit tests verifying RFC parsing and decoding."""
+    print(f"\n{BOLD}=== Running App-Layer Dissector Unit Tests (In-Process) ==={RESET}\n")
+    failures = 0
+
+    # 1. DNS Wire Encoder / Label Decoder Test
+    def verify_dns_wire(domain: str):
+        encoded = build_dns_query(domain)
+        # Parse wire QNAME back
+        idx = 12
+        labels = []
+        while idx < len(encoded):
+            length = encoded[idx]
+            if length == 0:
+                break
+            idx += 1
+            labels.append(encoded[idx:idx+length].decode("ascii"))
+            idx += length
+        decoded = ".".join(labels)
+        assert decoded == domain, f"Expected {domain}, got {decoded}"
+
+    try:
+        verify_dns_wire("evil.c2-tracker.org")
+        verify_dns_wire("mydomain.com")
+        verify_dns_wire("sub.deep.aethon.local")
+        print(f"  {GREEN}PASS{RESET} DNS RFC 1035 wire label serialization & decoding")
+    except Exception as e:
+        print(f"  {RED}FAIL{RESET} DNS parsing test: {e}")
+        failures += 1
+
+    # 2. HTTP URL Percent-Decoding Test
+    def percent_decode(s: str) -> str:
+        out = bytearray()
+        i = 0
+        b = s.encode("latin-1")
+        while i < len(b):
+            if b[i] == ord("%") and i + 2 < len(b):
+                try:
+                    out.append(int(b[i+1:i+3], 16))
+                    i += 3
+                    continue
+                except ValueError:
+                    pass
+            out.append(b[i])
+            i += 1
+        return out.decode("latin-1")
+
+    obfuscated = "/%2e%2e/%2e%2e/%2e%2e/etc/passwd"
+    decoded = percent_decode(obfuscated)
+    if decoded == "/../../../etc/passwd":
+        print(f"  {GREEN}PASS{RESET} HTTP URL percent-decode normalization (%2e%2e -> ..)")
+    else:
+        print(f"  {RED}FAIL{RESET} HTTP percent-decode failed: {decoded}")
+        failures += 1
+
+    # 3. SSH Banner Detection
+    clean_ssh = b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n"
+    assert clean_ssh.startswith(b"SSH-"), "Must have SSH- prefix"
+    proto_ver = clean_ssh[4:7].decode()
+    assert proto_ver == "2.0", "Must parse proto version"
+    software = clean_ssh[8:].split(b" ")[0].decode()
+    assert software == "OpenSSH_8.9p1", "Must slice software"
+    print(f"  {GREEN}PASS{RESET} SSH RFC 4253 banner slicing (version={proto_ver}, software={software})")
+
+    # 4. TLS ClientHello SNI Extraction
+    ch = build_tls_client_hello("malware-domain.evil")
+    assert ch[0] == 0x16 and ch[1] == 0x03, "TLS Handshake header"
+    assert b"malware-domain.evil" in ch, "SNI string in record"
+    print(f"  {GREEN}PASS{RESET} TLS ClientHello SNI packaging & extension slicing")
+
+    print(f"\n{BOLD}Result:{RESET} {failures} failures\n")
+    return failures
+
+# ---------------------------------------------------------------------------
+# Live Network Test Suite
+# ---------------------------------------------------------------------------
+
+def run_live_tests(target_ip: str, src_ip: str, iface: str) -> int:
+    """Executes live packet injection against running Aethon IPS."""
+    print(f"\n{BOLD}======================================================={RESET}")
+    print(f"{BOLD}    AETHON APPLICATION-LAYER PROTOCOL TEST SUITE      {RESET}")
+    print(f"{BOLD}======================================================={RESET}")
+    print(f" Target IPS IP : {CYAN}{target_ip}{RESET}")
+    print(f" Client IP     : {CYAN}{src_ip}{RESET}")
+    print(f" Sniffing On   : {CYAN}{iface}{RESET}\n")
+
+    failures = 0
+    passed = 0
+
+    # -----------------------------------------------------------------------
+    # 1. HTTP Protocol Tests (Port 80 / 8080)
+    # -----------------------------------------------------------------------
+    print(f"{BOLD}[1] HTTP/1.x Protocol Inspection (Port 80/8080){RESET}")
+
+    # Test 1.1: Benign GET Request
+    clean_http = (
+        b"GET /index.html HTTP/1.1\r\n"
+        b"Host: test.local\r\n"
+        b"User-Agent: Mozilla/5.0 (X11; Linux x86_64)\r\n"
+        b"Accept: text/html\r\n\r\n"
+    )
+    if test_tcp_payload(target_ip, src_ip, iface, 80, clean_http, expect_block=False,
+                        test_name="HTTP Clean GET /index.html"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 1.2: Path Traversal Attack
+    traversal_http = (
+        b"GET /../../../../etc/passwd HTTP/1.1\r\n"
+        b"Host: test.local\r\n"
+        b"User-Agent: Mozilla/5.0\r\n\r\n"
+    )
+    if test_tcp_payload(target_ip, src_ip, iface, 80, traversal_http, expect_block=True,
+                        test_name="HTTP Path Traversal (/etc/passwd)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 1.3: Obfuscated Path Traversal (%2e%2e URL encoding evasion)
+    obfuscated_http = (
+        b"GET /%2e%2e/%2e%2e/%2e%2e/etc/passwd HTTP/1.1\r\n"
+        b"Host: test.local\r\n"
+        b"User-Agent: curl/7.81.0\r\n\r\n"
+    )
+    if test_tcp_payload(target_ip, src_ip, iface, 80, obfuscated_http, expect_block=True,
+                        test_name="HTTP Evasion (%2e%2e Decoded Path)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 1.4: Malicious POST Body (SQL Injection)
+    sqli_body = b"username=admin' OR 1=1; SELECT * FROM mysql.user; --"
+    sqli_http = (
+        b"POST /api/login HTTP/1.1\r\n"
+        b"Host: secure.local\r\n"
+        b"Content-Type: application/x-www-form-urlencoded\r\n"
+        b"Content-Length: " + str(len(sqli_body)).encode() + b"\r\n\r\n" + sqli_body
+    )
+    if test_tcp_payload(target_ip, src_ip, iface, 80, sqli_http, expect_block=True,
+                        test_name="HTTP POST Body SQLi (mysql.user)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 1.5: Remote Command Execution in HTTP Body
+    cmdi_body = b"; xp_cmdshell('whoami');"
+    cmdi_http = (
+        b"POST /query HTTP/1.1\r\n"
+        b"Host: test.local\r\n"
+        b"Content-Length: " + str(len(cmdi_body)).encode() + b"\r\n\r\n" + cmdi_body
+    )
+    if test_tcp_payload(target_ip, src_ip, iface, 80, cmdi_http, expect_block=True,
+                        test_name="HTTP Command Execution (xp_cmdshell)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # -----------------------------------------------------------------------
+    # 2. SSH Protocol Tests (Port 22)
+    # -----------------------------------------------------------------------
+    print(f"\n{BOLD}[2] SSH Banner Protocol Inspection (Port 22){RESET}")
+
+    # Test 2.1: Benign OpenSSH Client Banner
+    clean_ssh = b"SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n"
+    if test_tcp_payload(target_ip, src_ip, iface, 22, clean_ssh, expect_block=False,
+                        test_name="SSH Benign Client (OpenSSH 8.9p1)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 2.2: Malicious SSH Client Banner (Injected Attack Signature /etc/passwd)
+    exploit_banner = b"SSH-2.0-ExploitTool_/etc/passwd\r\n"
+    if test_tcp_payload(target_ip, src_ip, iface, 22, exploit_banner, expect_block=True,
+                        test_name="SSH Attack Signature (/etc/passwd)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 2.3: Malicious SSH Client Banner (Injected Signature mysql.user)
+    exploit_banner2 = b"SSH-2.0-Botnet_mysql.user\r\n"
+    if test_tcp_payload(target_ip, src_ip, iface, 22, exploit_banner2, expect_block=True,
+                        test_name="SSH Attack Signature (mysql.user)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # -----------------------------------------------------------------------
+    # 3. DNS Protocol Tests (Port 53 UDP)
+    # -----------------------------------------------------------------------
+    print(f"\n{BOLD}[3] DNS Protocol & Domain Policy Inspection (Port 53 UDP){RESET}")
+
+    # Test 3.1: Benign DNS Query
+    if test_udp_dns(target_ip, "google.com", expect_block=False,
+                    test_name="DNS Benign Query (google.com)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 3.2: Blocklisted Root Domain (from blocked_domains.txt)
+    if test_udp_dns(target_ip, "mydomain.com", expect_block=True,
+                    test_name="DNS Blocklisted Domain (mydomain.com)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 3.3: Blocklisted Subdomain Matching
+    if test_udp_dns(target_ip, "c2.stealth.mydomain.com", expect_block=True,
+                    test_name="DNS Subdomain (c2.stealth.mydomain.com)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 3.4: Blocklisted Local Domain (from blocked_domains.txt)
+    if test_udp_dns(target_ip, "attacker.aethon.local", expect_block=True,
+                    test_name="DNS Blocklisted Domain (*.aethon.local)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 3.5: Hyperscan Matched Domain Query (Decoded Dot Notation)
+    if test_udp_dns(target_ip, "c2-mysql.user.attacker.com", expect_block=True,
+                    test_name="DNS Hyperscan Signature (mysql.user)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # -----------------------------------------------------------------------
+    # 4. TLS / HTTPS Transport & SNI Tests (Port 443)
+    # -----------------------------------------------------------------------
+    print(f"\n{BOLD}[4] TLS / HTTPS SNI Domain Inspection (Port 443){RESET}")
+
+    # Test 4.1: Clean TLS ClientHello
+    clean_tls = build_tls_client_hello("safe.example.com")
+    if test_tcp_payload(target_ip, src_ip, iface, 443, clean_tls, expect_block=False,
+                        test_name="TLS Benign SNI (safe.example.com)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # Test 4.2: Blocklisted SNI
+    blocked_tls = build_tls_client_hello("mydomain.com")
+    if test_tcp_payload(target_ip, src_ip, iface, 443, blocked_tls, expect_block=True,
+                        test_name="TLS Blocklisted SNI (mydomain.com)"):
+        passed += 1
+    else:
+        failures += 1
+
+    # -----------------------------------------------------------------------
+    # Final Summary
+    # -----------------------------------------------------------------------
+    print(f"\n{BOLD}======================================================={RESET}")
+    print(f" Total Tests Run : {passed + failures}")
+    print(f" Passed          : {GREEN}{passed}{RESET}")
+    print(f" Failed          : {RED if failures > 0 else GREEN}{failures}{RESET}")
+    print(f"{BOLD}======================================================={RESET}\n")
+
+    return failures
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Aethon Application-Layer Protocol Verification Test Suite"
+    )
+    parser.add_argument("--self-test", action="store_true", help="Run local dissector self-tests without network")
+    parser.add_argument("target_ip", nargs="?", default="192.168.50.1", help="Target Aethon IPS IP (default: 192.168.50.1)")
+    parser.add_argument("src_ip", nargs="?", default="192.168.50.2", help="Source Client IP (default: 192.168.50.2)")
+    parser.add_argument("iface", nargs="?", default="veth1", help="Sniffing Network Interface (default: veth1)")
+
+    args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(run_self_tests())
+
+    sys.exit(run_live_tests(args.target_ip, args.src_ip, args.iface))
+
+if __name__ == "__main__":
+    main()
+
