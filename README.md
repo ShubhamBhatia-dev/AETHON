@@ -2,7 +2,7 @@
 
 **An inline intrusion prevention system and TLS-terminating reverse proxy built on eBPF/XDP and AF_XDP, with its own userspace TCP stack.**
 
-Aethon sits in front of your web services on a single Linux host. XDP steers traffic for the ports you protect into userspace through AF_XDP sockets; everything else (SSH, DNS, IPv6, UDP) goes straight to the kernel untouched. In userspace, Aethon terminates TCP and TLS itself, inspects the plaintext with Hyperscan in streaming mode, enforces SNI policy, and proxies clean traffic to your backends on loopback.
+Aethon sits in front of your web services on a single Linux host on your network. XDP steers traffic for the ports you protect into userspace through AF_XDP sockets; everything else (SSH, DNS, IPv6, UDP) goes straight to the kernel untouched. In userspace, Aethon terminates TCP and TLS itself, inspects the plaintext with Hyperscan in streaming mode, enforces SNI policy, and proxies clean traffic to your backends on loopback.
 
 ![C++20](https://img.shields.io/badge/C%2B%2B-20-blue) ![Linux](https://img.shields.io/badge/platform-Linux-lightgrey) ![eBPF/XDP](https://img.shields.io/badge/eBPF-XDP%20%2B%20AF__XDP-orange) ![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
