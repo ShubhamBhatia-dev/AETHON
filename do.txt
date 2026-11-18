@@ -7,6 +7,7 @@
   gaps can be fixed in a few weeks, and fixing them is exactly the kind of work those companies
   look for.
 
+
   What's genuinely good
 
   - The topic choice is excellent. AF_XDP, eBPF/XDP, Hyperscan, TCP reassembly and TLS
